@@ -20,7 +20,7 @@ if [ -z "$OPENAS2_PID" ]; then
 fi
 
 # Set some Java memory pool settings to something reasonable
-EXTRA_PARMS="$EXTRA_PARMS -Xms32m -Xmx384m"
+EXTRA_PARMS="$EXTRA_PARMS -Xms256m -Xmx2048m -XX:+UseG1GC"
 
 # Set the config file location
 if [ -z $OPENAS2_CONFIG_FILE ]; then

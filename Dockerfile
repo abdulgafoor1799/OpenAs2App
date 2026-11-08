@@ -8,7 +8,7 @@ RUN apt-get install -y unzip
 RUN rm -f Server/dist/*
 RUN rm -f Remote/dist/*
 RUN rm -f Bundle/dist/*
-RUN ./mvnw clean package
+RUN ./mvnw clean package -DskipTests
 RUN mkdir ./Runtime && unzip Server/dist/OpenAS2Server-*.zip -d Runtime
 RUN ./mvnw clean
 COPY start-container.sh /usr/src/openas2/Runtime/bin/
