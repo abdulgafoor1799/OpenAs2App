@@ -6,9 +6,12 @@ import org.openas2.cert.CertificateFactory;
 import org.openas2.lib.message.AS2Standards;
 import org.openas2.message.MessageFactory;
 import org.openas2.partner.PartnershipFactory;
+import org.openas2.processor.ActiveModule;
 import org.openas2.processor.Processor;
 import org.openas2.processor.ProcessorModule;
 import org.openas2.processor.receiver.DirectoryPollingModule;
+import org.openas2.processor.sender.InterruptedSendReport;
+import org.openas2.util.FileUtil;
 import org.openas2.util.Properties;
 import org.openas2.util.XMLUtil;
 import org.w3c.dom.Node;
@@ -20,6 +23,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 
 public abstract class BaseSession implements Session {
@@ -42,12 +46,16 @@ public abstract class BaseSession implements Session {
 
     @Override
     public void start() throws OpenAS2Exception {
+        // Before anything starts, so every file found is one no running send can account for
+        InterruptedSendReport.logInterruptedSends(this);
         getProcessor().startActiveModules();
         startPartnershipPollers();
     }
 
     @Override
     public void stop() throws Exception {
+        // The "shutdown" command stops the session directly, so it has to wait here as well
+        drainWorkInProgress();
         destroyPartnershipPollers(null);
         for (Component component : components.values()) {
             component.destroy();
@@ -185,6 +193,97 @@ public abstract class BaseSession implements Session {
         }
     }
 
+    /**
+     * Synchronously stop and untrack the poller for a single named partnership, if one is
+     * currently registered. Used when a partnership is deleted outside of a full config
+     * reload (e.g. via the REST API) so that its outbox directory is freed up immediately
+     * rather than waiting for the next scheduled partnerships file refresh.
+     *
+     * @param partnershipName - name attribute value for the partnership whose poller should be destroyed
+     */
+    public boolean drainWorkInProgress() {
+        String value = Properties.getProperty(Properties.SHUTDOWN_WAIT_SECONDS, Properties.DEFAULT_SHUTDOWN_WAIT_SECONDS);
+        long seconds;
+        try {
+            seconds = Math.max(0, Long.parseLong(value.trim()));
+        } catch (NumberFormatException e) {
+            LOGGER.warn("Invalid " + Properties.SHUTDOWN_WAIT_SECONDS + " value \"" + value + "\", using "
+                    + Properties.DEFAULT_SHUTDOWN_WAIT_SECONDS);
+            seconds = Long.parseLong(Properties.DEFAULT_SHUTDOWN_WAIT_SECONDS);
+        }
+        return drainWorkInProgress(TimeUnit.SECONDS.toMillis(seconds));
+    }
+
+    public boolean drainWorkInProgress(long timeoutMillis) {
+        List<ActiveModule> modules = new ArrayList<ActiveModule>();
+        // Directory pollers are tracked here rather than by the processor, so both have to be asked
+        for (Map<String, Object> meta : polledDirectories.values()) {
+            modules.add((ActiveModule) meta.get("pollerInstance"));
+        }
+        try {
+            modules.addAll(getProcessor().getActiveModules());
+        } catch (ComponentNotFoundException e) {
+            LOGGER.warn("No processor found to stop modules taking new work: " + e.getMessage());
+        }
+        // Stop everything taking new work before waiting on any of it, so the waits overlap
+        for (ActiveModule module : modules) {
+            module.stopTakingWork();
+        }
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        List<String> stillBusy = new ArrayList<String>();
+        for (ActiveModule module : modules) {
+            long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+            try {
+                if (!module.awaitIdle(Math.max(0, remaining))) {
+                    stillBusy.add(describe(module));
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                stillBusy.add(describe(module));
+                break;
+            }
+        }
+        if (stillBusy.isEmpty()) {
+            LOGGER.info("All work in progress finished before shutting down.");
+            return true;
+        }
+        LOGGER.warn("Shutting down with work still in progress after waiting " + timeoutMillis + "ms, which will be"
+                + " cut off: " + stillBusy + ". Files part way through being sent are left in the pending folder"
+                + " and are reported when the server next starts.");
+        return false;
+    }
+
+    private String describe(ActiveModule module) {
+        if (module instanceof DirectoryPollingModule) {
+            return "poller for " + ((DirectoryPollingModule) module).getOutboxDir();
+        }
+        return module.getClass().getSimpleName();
+    }
+
+    public void destroyPartnershipPoller(String partnershipName) {
+        String pollerKeyToRemove = null;
+        for (Map.Entry<String, Map<String, Object>> entry : polledDirectories.entrySet()) {
+            Map<String, Object> meta = entry.getValue();
+            if (partnershipName.equals(meta.get("partnershipName"))) {
+                DirectoryPollingModule poller = (DirectoryPollingModule) meta.get("pollerInstance");
+                try {
+                    LOGGER.trace("Destroying poller for deleted partnership " + partnershipName + ":" + meta);
+                    if (poller.isRunning()) {
+                        poller.stop();
+                    }
+                } catch (Exception e) {
+                    LOGGER.error("Failed to stop the partnership poller for partnership " + partnershipName + ": " + meta, e);
+                }
+                pollerKeyToRemove = entry.getKey();
+                break;
+            }
+        }
+        if (pollerKeyToRemove != null) {
+            polledDirectories.remove(pollerKeyToRemove);
+            LOGGER.trace("Removed poller from cache map:" + pollerKeyToRemove);
+        }
+    }
+
     public DirectoryPollingModule getPartnershipPoller(String partnershipName) {
         for (Map.Entry<String, Map<String, Object>> entry : polledDirectories.entrySet()) {
             Map<String, Object> meta = entry.getValue();
@@ -216,6 +315,10 @@ public abstract class BaseSession implements Session {
             return;
         }
         String pollerDir = procmod.getParameters().get(DirectoryPollingModule.PARAM_OUTBOX_DIRECTORY);
+        if (pollerDir == null || pollerDir.length() == 0) {
+            throw new OpenAS2Exception("Poller is missing outboxdir parameter for partnership: " + partnershipName);
+        }
+        pollerDir = FileUtil.getNormalisedPath(pollerDir);
         try {
             checkPollerModuleConfig(pollerDir);
         } catch (OpenAS2Exception oae) {

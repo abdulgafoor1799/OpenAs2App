@@ -44,7 +44,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-
 /**
  * original author unknown
  * <p>
@@ -103,22 +102,53 @@ public class XMLPartnershipFactory extends BasePartnershipFactory implements Has
 
             DocumentBuilder parser = factory.newDocumentBuilder();
             Document document = parser.parse(inputStream);
+            removeWhitespaceOnlyTextNodes(document);
             setPartnershipsXml(document);
         } catch (Exception e) {
             throw new WrappedException(e);
         }
+
+    }
+
+    /**
+     * Removes the text nodes that hold nothing but the layout whitespace of the file as it was read.
+     * <p>
+     * The parser keeps the newlines and indentation between elements as text nodes, and the serializer
+     * used to store the partnerships adds indentation of its own without being able to remove those.
+     * Storing a document that still carried them therefore wrote the original whitespace plus a fresh
+     * layer of it, so every save grew the file by another set of blank lines. Discarding them when the
+     * file is read leaves the serializer as the only thing deciding the layout, and also tidies a file
+     * that has already accumulated them the next time it is stored.
+     * <p>
+     * Only text nodes that are entirely whitespace are removed, so element content is never affected.
+     * Nothing in a partnerships file carries text content in any case: every value is an attribute.
+     *
+     * @param doc - the freshly parsed partnerships document
+     * @throws XPathExpressionException if the fixed expression below fails to compile
+     */
+    private static void removeWhitespaceOnlyTextNodes(Document doc) throws XPathExpressionException {
+        XPathExpression expr = XPathFactory.newInstance().newXPath().compile("//text()[normalize-space(.) = '']");
+        NodeList whitespaceOnly = (NodeList) expr.evaluate(doc, XPathConstants.NODESET);
+        for (int i = 0; i < whitespaceOnly.getLength(); i++) {
+            Node node = whitespaceOnly.item(i);
+            node.getParentNode().removeChild(node);
+        }
     }
 
     void refreshConfig() throws OpenAS2Exception {
-        getSession().destroyPartnershipPollers(Session.PARTNERSHIP_POLLER);
+        Map<String, Object> newPartners = new HashMap<String, Object>();
+        List<Partnership> newPartnerships = new ArrayList<Partnership>();
+        /* Parse the whole file before touching the running pollers. Anything that goes wrong
+         * parsing then leaves the currently running configuration untouched rather than killing
+         * the pollers and aborting part way through the reload.
+         */
+        List<Node> pollerNodes = new ArrayList<Node>();
+        List<Partnership> pollerPartnerships = new ArrayList<Partnership>();
         try {
             Element root = getPartnershipsXml().getDocumentElement();
             NodeList rootNodes = root.getChildNodes();
             Node rootNode;
             String nodeName;
-
-            Map<String, Object> newPartners = new HashMap<String, Object>();
-            List<Partnership> newPartnerships = new ArrayList<Partnership>();
 
             for (int i = 0; i < rootNodes.getLength(); i++) {
                 rootNode = rootNodes.item(i);
@@ -126,18 +156,36 @@ public class XMLPartnershipFactory extends BasePartnershipFactory implements Has
                 nodeName = rootNode.getNodeName();
 
                 if (nodeName.equals("partner")) {
-                    loadPartner(newPartners, rootNode);
+                    loadPartner(newPartners, rootNode, false);
                 } else if (nodeName.equals("partnership")) {
-                    loadPartnership(newPartners, newPartnerships, rootNode);
+                    Partnership partnership = loadPartnership(newPartners, newPartnerships, rootNode, false);
+                    if (partnership != null) {
+                        pollerNodes.add(rootNode);
+                        pollerPartnerships.add(partnership);
+                    }
                 }
-            }
-
-            synchronized (this) {
-                setPartners(newPartners);
-                setPartnerships(newPartnerships);
             }
         } catch (Exception e) {
             throw new WrappedException(e);
+        }
+
+        synchronized (this) {
+            setPartners(newPartners);
+            setPartnerships(newPartnerships);
+        }
+
+        // The parsed config is good so now swap the pollers over to the new configuration
+        getSession().destroyPartnershipPollers(Session.PARTNERSHIP_POLLER);
+        for (int i = 0; i < pollerNodes.size(); i++) {
+            Partnership partnership = pollerPartnerships.get(i);
+            try {
+                setupPartnershipPoller(pollerNodes.get(i), partnership);
+            } catch (Exception e) {
+                /* A poller that cannot be configured must not prevent the rest of the partnerships
+                 * from having their pollers started so report it and keep going.
+                 */
+                logger.error("Failed to configure the directory poller for partnership " + partnership.getName() + ": " + org.openas2.util.Logging.getExceptionMsg(e), e);
+            }
         }
     }
 
@@ -149,13 +197,31 @@ public class XMLPartnershipFactory extends BasePartnershipFactory implements Has
     }
 
     public void loadPartner(Map<String, Object> partners, Node node) throws OpenAS2Exception {
+        loadPartner(partners, node, true);
+    }
+
+    /**
+     * Load a partner definition into the passed map of partners.
+     *
+     * @param partners          - the map of partners the loaded partner is added to
+     * @param node              - the XML node containing the partner definition
+     * @param failOnDuplicate   - if true a partner that is already defined causes an exception,
+     *                            otherwise the duplicate is logged as an error and ignored so that
+     *                            the first definition found remains in effect
+     * @throws OpenAS2Exception - the partner definition could not be loaded
+     */
+    public void loadPartner(Map<String, Object> partners, Node node, boolean failOnDuplicate) throws OpenAS2Exception {
         String[] requiredAttributes = {Partnership.PID_NAME};
 
         Map<String, String> newPartner = XMLUtil.mapAttributes(node, requiredAttributes);
         String name = newPartner.get(Partnership.PID_NAME);
 
         if (partners.get(name) != null) {
-            throw new OpenAS2Exception("Partner is defined more than once: " + name);
+            if (failOnDuplicate) {
+                throw new OpenAS2Exception("Partner is defined more than once: " + name);
+            }
+            logger.error("Partner is defined more than once in the partnerships file so the duplicate definition is ignored and the first one found is used: " + name);
+            return;
         }
 
         partners.put(name, newPartner);
@@ -191,6 +257,27 @@ public class XMLPartnershipFactory extends BasePartnershipFactory implements Has
     }
 
     public void loadPartnership(Map<String, Object> partners, List<Partnership> partnerships, Node node) throws OpenAS2Exception {
+        Partnership partnership = loadPartnership(partners, partnerships, node, true);
+        if (partnership != null) {
+            setupPartnershipPoller(node, partnership);
+        }
+    }
+
+    /**
+     * Load a partnership definition into the passed list of partnerships. This only parses the
+     * partnership. Use {@link #setupPartnershipPoller(Node, Partnership)} to activate any directory
+     * poller configured for it.
+     *
+     * @param partners          - the map of partners the partnership sender and receiver are looked up in
+     * @param partnerships      - the list of partnerships the loaded partnership is added to
+     * @param node              - the XML node containing the partnership definition
+     * @param failOnDuplicate   - if true a partnership that is already defined causes an exception,
+     *                            otherwise the duplicate is logged as an error and ignored so that
+     *                            the first definition found remains in effect
+     * @return the loaded partnership or null if it was ignored as a duplicate
+     * @throws OpenAS2Exception - the partnership definition could not be loaded
+     */
+    public Partnership loadPartnership(Map<String, Object> partners, List<Partnership> partnerships, Node node, boolean failOnDuplicate) throws OpenAS2Exception {
         Partnership partnership = new Partnership();
         String[] requiredAttributes = {"name"};
 
@@ -198,7 +285,11 @@ public class XMLPartnershipFactory extends BasePartnershipFactory implements Has
         String name = psAttributes.get("name");
 
         if (getPartnership(partnerships, name) != null) {
-            throw new OpenAS2Exception("Partnership is defined more than once: " + name);
+            if (failOnDuplicate) {
+                throw new OpenAS2Exception("Partnership is defined more than once: " + name);
+            }
+            logger.error("Partnership is defined more than once in the partnerships file so the duplicate definition is ignored and the first one found is used: " + name);
+            return null;
         }
 
         partnership.setName(name);
@@ -220,7 +311,21 @@ public class XMLPartnershipFactory extends BasePartnershipFactory implements Has
         }
         // add the partnership to the list of available partnerships
         partnerships.add(partnership);
-        
+
+        return partnership;
+    }
+
+    /**
+     * Activate the directory polling module configured for a partnership, if there is one.
+     * Any poller currently running for the partnership must have been destroyed before calling
+     * this otherwise the polled directory will be rejected as already in use.
+     *
+     * @param node          - the XML node containing the partnership definition
+     * @param partnership   - the partnership the poller belongs to
+     * @throws OpenAS2Exception - the poller could not be configured
+     */
+    public void setupPartnershipPoller(Node node, Partnership partnership) throws OpenAS2Exception {
+        String name = partnership.getName();
         // Now check if we need to add a directory polling module
         Node pollerCfgNode = XMLUtil.findChildNode(node, Partnership.PCFG_POLLER);
         if (pollerCfgNode != null) {
@@ -234,6 +339,16 @@ public class XMLPartnershipFactory extends BasePartnershipFactory implements Has
             String[] requiredPollerAttributes = {"enabled"};
             Map<String, String> partnershipPollerCfgAttributes = XMLUtil.mapAttributes(pollerCfgNode, requiredPollerAttributes);
             if ("true".equalsIgnoreCase(partnershipPollerCfgAttributes.get("enabled"))) {
+                if (isPartnershipPollingDisabled()) {
+                    /*
+                     * Partnership polling is globally disabled so no poller is created for this
+                     * partnership. The partnership itself remains fully usable for receiving messages.
+                     */
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Partnership polling is globally disabled so no poller was started for partnership: " + name);
+                    }
+                    return;
+                }
                 if (logger.isTraceEnabled()) {
                         logger.trace("Found partnership poller for partnership: " + name);
                 }
@@ -264,6 +379,136 @@ public class XMLPartnershipFactory extends BasePartnershipFactory implements Has
                 getSession().loadPartnershipPoller(pollerConfigElem, name, Session.PARTNERSHIP_POLLER);
             }
         }
+    }
+
+    /**
+     * Merges attributes into an existing partner element and reloads the in-memory partnerships so
+     * they match. Attributes that are not supplied are left as they are, so this is a partial update
+     * rather than a replacement. The caller is responsible for persisting the document afterwards.
+     *
+     * @param name - the name of the partner to update. Partners are not renamed by this method
+     * @param attributes - the attributes to set, replacing the value of any that already exist
+     * @throws OpenAS2Exception if the partner does not exist
+     */
+    public void updatePartner(String name, Map<String, String> attributes) throws OpenAS2Exception {
+        Element partner = findNamedElement("partner", name);
+        if (partner == null) {
+            throw new OpenAS2Exception("Unknown partner name: " + name);
+        }
+        for (Map.Entry<String, String> attribute : attributes.entrySet()) {
+            partner.setAttribute(attribute.getKey(), attribute.getValue());
+        }
+        // Rebuild the in-memory partners and partnerships from the changed document so a partnership
+        // that inherits from this partner picks the change up too
+        refreshConfig();
+    }
+
+    /**
+     * Merges attributes, poller configuration and partner references into an existing partnership
+     * element and reloads the in-memory partnerships so they match. Anything not supplied is left as
+     * it is. The caller is responsible for persisting the document afterwards.
+     *
+     * @param name - the name of the partnership to update. Partnerships are not renamed by this method
+     * @param attributes - partnership attributes to set, or null to leave them alone
+     * @param pollerConfig - poller configuration attributes to set, or null to leave them alone
+     * @param senderName - the partner to point the sender at, or null to leave it alone
+     * @param receiverName - the partner to point the receiver at, or null to leave it alone
+     * @throws OpenAS2Exception if the partnership, or a partner it is being pointed at, does not exist
+     */
+    public void updatePartnership(String name, Map<String, String> attributes, Map<String, String> pollerConfig, String senderName, String receiverName) throws OpenAS2Exception {
+        Element partnership = findNamedElement("partnership", name);
+        if (partnership == null) {
+            throw new OpenAS2Exception("Partnership not found: " + name);
+        }
+        if (senderName != null) {
+            repointPartnership(partnership, name, Partnership.PTYPE_SENDER, senderName);
+        }
+        if (receiverName != null) {
+            repointPartnership(partnership, name, Partnership.PTYPE_RECEIVER, receiverName);
+        }
+        if (attributes != null) {
+            for (Map.Entry<String, String> attribute : attributes.entrySet()) {
+                setPartnershipAttribute(partnership, attribute.getKey(), attribute.getValue());
+            }
+        }
+        if (pollerConfig != null && !pollerConfig.isEmpty()) {
+            Node pollerNode = XMLUtil.findChildNode(partnership, Partnership.PCFG_POLLER);
+            Element pollerElem;
+            if (pollerNode == null) {
+                pollerElem = getPartnershipsXml().createElement(Partnership.PCFG_POLLER);
+                partnership.appendChild(pollerElem);
+            } else {
+                pollerElem = (Element) pollerNode;
+            }
+            for (Map.Entry<String, String> attribute : pollerConfig.entrySet()) {
+                pollerElem.setAttribute(attribute.getKey(), attribute.getValue());
+            }
+        }
+        refreshConfig();
+    }
+
+    private void repointPartnership(Element partnership, String partnershipName, String partnerType, String partnerName) throws OpenAS2Exception {
+        if (getPartners().get(partnerName) == null) {
+            throw new OpenAS2Exception("Partnership " + partnershipName + " has an undefined " + partnerType + ": " + partnerName);
+        }
+        Node partnerRef = XMLUtil.findChildNode(partnership, partnerType);
+        Element partnerElem;
+        if (partnerRef == null) {
+            partnerElem = getPartnershipsXml().createElement(partnerType);
+            partnership.appendChild(partnerElem);
+        } else {
+            partnerElem = (Element) partnerRef;
+        }
+        partnerElem.setAttribute(Partnership.PID_NAME, partnerName);
+    }
+
+    /**
+     * Sets an "attribute" child of a partnership, replacing the value if one with that name is
+     * already present rather than appending a second one.
+     */
+    private void setPartnershipAttribute(Element partnership, String attrName, String attrValue) {
+        NodeList children = partnership.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if (!"attribute".equals(child.getNodeName())) {
+                continue;
+            }
+            Node nameAttrib = child.getAttributes().getNamedItem("name");
+            if (nameAttrib != null && attrName.equals(nameAttrib.getNodeValue())) {
+                ((Element) child).setAttribute("value", attrValue);
+                return;
+            }
+        }
+        Element elem = getPartnershipsXml().createElement("attribute");
+        elem.setAttribute("name", attrName);
+        elem.setAttribute("value", attrValue);
+        partnership.appendChild(elem);
+    }
+
+    /**
+     * Finds a top level element of the given type by its name attribute. Walking the children rather
+     * than using XPath keeps names containing quotes from breaking the lookup.
+     *
+     * @return the matching element, or null if there is not exactly one
+     */
+    private Element findNamedElement(String elementName, String name) {
+        Element found = null;
+        NodeList children = getPartnershipsXml().getDocumentElement().getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if (!elementName.equals(child.getNodeName())) {
+                continue;
+            }
+            Node nameAttrib = child.getAttributes().getNamedItem(Partnership.PID_NAME);
+            if (nameAttrib != null && name.equals(nameAttrib.getNodeValue())) {
+                if (found != null) {
+                    logger.error("More than one " + elementName + " element is named \"" + name + "\" so it cannot be updated.");
+                    return null;
+                }
+                found = (Element) child;
+            }
+        }
+        return found;
     }
 
     /**
@@ -355,76 +600,5 @@ public class XMLPartnershipFactory extends BasePartnershipFactory implements Has
 
     public void setPartnershipsXml(Document partnershipsXml) {
         this.partnershipsXml = partnershipsXml;
-    }
-
-    public void replacePartnershipPlaceHolders(Document doc, Partnership partnership) throws OpenAS2Exception {
-        String xpathExpression = "//*[@*[contains(.,'$partnership.')]]/@*";
-        // Create XPathFactory object
-        XPathFactory xpathFactory = XPathFactory.newInstance();
-        // Create XPath object
-        XPath xpath = xpathFactory.newXPath();
-        try {
-            // Create XPathExpression object
-            XPathExpression expr = xpath.compile(xpathExpression);
-            // Evaluate expression result on XML document
-            NodeList nodes = (NodeList) expr.evaluate(doc, XPathConstants.NODESET);
-            Pattern PATTERN = Pattern.compile("\\$partnership\\.([^\\$]++)\\$");
-
-            for (int i = 0; i < nodes.getLength(); i++) {
-                Node node = nodes.item(i);
-                String val = node.getNodeValue();
-                //logger.debug("Partnership place holder NODE processing: " + val);
-                StringBuffer strBuf = new StringBuffer();
-                Matcher matcher = PATTERN.matcher(val);
-                boolean hasChanged = false;
-                while (matcher.find()) {
-                    String value = null;
-                    String[] keys = matcher.group(1).split("\\.");
-                    if (keys.length == 1) {
-                        switch (keys[0]) {
-                        case "name":
-                            value = partnership.getName();
-                            break;
-                        default:
-                            throw new OpenAS2Exception(
-                                    "The partnership placeholder cannot be resolved: " + keys[0] + " in " + val);
-                        }
-                    } else if (keys.length == 2) {
-                        switch (keys[0]) {
-                        case "receiver":
-                            value = partnership.getReceiverID(keys[1]);
-                            break;
-                        case "sender":
-                            value = partnership.getSenderID(keys[1]);
-                            break;
-                        default:
-                            throw new OpenAS2Exception(
-                                    "The partnership placeholder cannot be resolved: " + keys[0] + " in " + val);
-                        }
-                    } else {
-                        // don't know how to handle this
-                        throw new OpenAS2Exception(
-                                "The partnership placeholder is invalid and cannot be parsed: " + val);
-                    }
-                    if (value == null) {
-                        throw new OpenAS2Exception(
-                                "Missing attribute value for replacement: " + matcher.group() + " in " + val);
-                    } else {
-                        hasChanged = true;
-                        matcher.appendReplacement(strBuf, Matcher.quoteReplacement(value));
-                        if (logger.isTraceEnabled()) {
-                            logger.trace("Partnership place holder replaced: " + keys + " :: Replaced with: " + value);
-                        }
-                    }
-                }
-                if (hasChanged) {
-                    matcher.appendTail(strBuf);
-                    node.setNodeValue(strBuf.toString());
-                }
-            }
-
-        } catch (XPathExpressionException e) {
-            e.printStackTrace();
-        }
     }
 }

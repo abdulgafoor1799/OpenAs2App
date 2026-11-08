@@ -18,6 +18,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.Statement;
+import java.sql.Timestamp;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -64,7 +65,8 @@ public class DbTrackingModule extends BaseMsgTrackingModule {
         dbPwd = getParameter(PARAM_DB_PWD, true);
         configBaseDir = session.getBaseDirectory();
         jdbcConnectString = getParameter(PARAM_JDBC_CONNECT_STRING, true);
-        jdbcConnectString.replace("%home%", configBaseDir);
+        // String is immutable - assign the result or the substitution is lost
+        jdbcConnectString = jdbcConnectString.replace("%home%", configBaseDir);
         // Support component attributes in connect string
         jdbcConnectString = ParameterParser.parse(jdbcConnectString, paramParser);
         dbPlatform = jdbcConnectString.replaceAll(".*jdbc:([^:]*):.*", "$1");
@@ -100,8 +102,12 @@ public class DbTrackingModule extends BaseMsgTrackingModule {
         String msgIdValue = map.get(msgIdField);
         try (Connection conn = dbHandler.getConnection()) {
             Statement s = conn.createStatement();
-            ResultSet rs = s.executeQuery(
-                    "SELECT * FROM " + tableName + " WHERE " + msgIdField + " = '" + msgIdValue + "'");
+            // Parameterised existence check: msgIdValue is partner-controlled (the inbound
+            // Message-ID header) so it must not be concatenated into the SQL.
+            PreparedStatement selectStmt = conn.prepareStatement(
+                    "SELECT * FROM " + tableName + " WHERE " + msgIdField + " = ?");
+            selectStmt.setString(1, msgIdValue);
+            ResultSet rs = selectStmt.executeQuery();
             ResultSetMetaData meta = rs.getMetaData();
             boolean isUpdate = rs.next(); // Record already exists so update
             if (logger.isTraceEnabled()) {
@@ -153,8 +159,8 @@ public class DbTrackingModule extends BaseMsgTrackingModule {
             if (fieldStmt.length() > 0) {
                 String stmt = "";
                 if (isUpdate) {
-                    stmt = "UPDATE " + tableName + " SET " + fieldStmt.toString() + " WHERE " + FIELDS.MSG_ID + " = '"
-                            + map.get(msgIdField) + "'";
+                    stmt = "UPDATE " + tableName + " SET " + fieldStmt.toString() + " WHERE " + FIELDS.MSG_ID + " = "
+                            + formatField(map.get(msgIdField), Types.VARCHAR);
                 } else {
                     stmt = "INSERT INTO " + tableName + " (" + fieldStmt.toString() + ") VALUES ("
                             + valuesStmt.toString() + ")";
@@ -181,27 +187,51 @@ public class DbTrackingModule extends BaseMsgTrackingModule {
         }
     }
 
-    public ArrayList<HashMap<String, String>> listMessages() {
+    /**
+     * List messages, optionally bounded by CREATE_DT. Either bound may be null, in which case
+     * that side is left open (a null "from" and null "to" together mean no date filter at all).
+     *
+     * @param from - lower bound (inclusive) on CREATE_DT, or null for no lower bound
+     * @param to   - upper bound (inclusive) on CREATE_DT, or null for no upper bound
+     */
+    public ArrayList<HashMap<String, String>> listMessages(Timestamp from, Timestamp to) {
 
         ArrayList<HashMap<String, String>> rows = new ArrayList<HashMap<String, String>>();
 
-        try (Connection conn = dbHandler.getConnection()) {
-            Statement s = conn.createStatement();
-            ResultSet rs = s.executeQuery("SELECT " + FIELDS.MSG_ID
-                    + ",CREATE_DT,SENDER_ID,RECEIVER_ID,MSG_ID,FILE_NAME,ENCRYPTION_ALGORITHM,SIGNATURE_ALGORITHM,MDN_MODE,STATE FROM "
-                    + tableName);
-            ResultSetMetaData meta = rs.getMetaData();
-            while (rs.next()) {
-                HashMap<String, String> row = new HashMap<String, String>();
-                for (int i = 1; i <= meta.getColumnCount(); i++) {
-                    String key = meta.getColumnName(i);
-                    String value = rs.getString(key);
-                    row.put(key, value);
+        StringBuilder sql = new StringBuilder("SELECT " + FIELDS.MSG_ID
+                + ",CREATE_DT,SENDER_ID,RECEIVER_ID,MSG_ID,FILE_NAME,ENCRYPTION_ALGORITHM,SIGNATURE_ALGORITHM,MDN_MODE,STATE FROM "
+                + tableName);
+        if (from != null) {
+            sql.append(sql.indexOf(" WHERE ") < 0 ? " WHERE " : " AND ").append("CREATE_DT >= ?");
+        }
+        if (to != null) {
+            sql.append(sql.indexOf(" WHERE ") < 0 ? " WHERE " : " AND ").append("CREATE_DT <= ?");
+        }
+        sql.append(" ORDER BY CREATE_DT DESC");
+
+        try (Connection conn = dbHandler.getConnection();
+                PreparedStatement s = conn.prepareStatement(sql.toString())) {
+            int paramIndex = 1;
+            if (from != null) {
+                s.setTimestamp(paramIndex++, from);
+            }
+            if (to != null) {
+                s.setTimestamp(paramIndex++, to);
+            }
+            try (ResultSet rs = s.executeQuery()) {
+                ResultSetMetaData meta = rs.getMetaData();
+                while (rs.next()) {
+                    HashMap<String, String> row = new HashMap<String, String>();
+                    for (int i = 1; i <= meta.getColumnCount(); i++) {
+                        String key = meta.getColumnName(i);
+                        String value = rs.getString(key);
+                        row.put(key, value);
+                    }
+                    rows.add(row);
                 }
-                rows.add(row);
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.error("Failed to list messages between " + from + " and " + to, e);
         }
         return rows;
     }
@@ -226,6 +256,59 @@ public class DbTrackingModule extends BaseMsgTrackingModule {
             e.printStackTrace();
         }
         return row;
+    }
+
+    /**
+     * Looks up the stored MDN file path for a message identified by its payload filename (matched
+     * against either the received file name or the sent file name). If more than one message shares
+     * the filename the most recently created one is returned.
+     *
+     * @param filename - the payload file name to search for
+     * @return the stored MDN file path, or null if there is no match with a recorded MDN path
+     */
+    public String getMdnFilePath(String filename) {
+        String sql = "SELECT " + FIELDS.MDN_FILE_PATH + " FROM " + tableName
+                + " WHERE (" + FIELDS.FILE_NAME + " = ? OR " + FIELDS.SENT_FILE_NAME + " = ?)"
+                + " AND " + FIELDS.MDN_FILE_PATH + " IS NOT NULL"
+                + " ORDER BY " + FIELDS.CREATE_DT + " DESC";
+        try (Connection conn = dbHandler.getConnection();
+                PreparedStatement s = conn.prepareStatement(sql)) {
+            s.setString(1, filename);
+            s.setString(2, filename);
+            try (ResultSet rs = s.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        } catch (Exception e) {
+            logger.error("Failed to look up MDN file path for filename: " + filename, e);
+            return null;
+        }
+    }
+
+    /**
+     * Looks up the stored MDN file path for a message identified by its AS2 message ID. Rows with no
+     * recorded MDN path are ignored. The message ID is unique in the schema (msg_id_unique), so at
+     * most one row can match and no ordering is needed to make the result deterministic.
+     *
+     * @param msgId - the AS2 message ID of the message the MDN was returned for
+     * @return the stored MDN file path, or null if there is no match with a recorded MDN path
+     */
+    public String getMdnFilePathByMessageId(String msgId) {
+        if (msgId == null || msgId.length() == 0) {
+            return null;
+        }
+        String sql = "SELECT " + FIELDS.MDN_FILE_PATH + " FROM " + tableName
+                + " WHERE " + FIELDS.MSG_ID + " = ?"
+                + " AND " + FIELDS.MDN_FILE_PATH + " IS NOT NULL";
+        try (Connection conn = dbHandler.getConnection();
+                PreparedStatement s = conn.prepareStatement(sql)) {
+            s.setString(1, msgId);
+            try (ResultSet rs = s.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        } catch (Exception e) {
+            logger.error("Failed to look up MDN file path for message ID: " + msgId, e);
+            return null;
+        }
     }
 
     public ArrayList<HashMap<String, String>> getDataCharts(HashMap<String, String> map) {
@@ -312,6 +395,7 @@ public class DbTrackingModule extends BaseMsgTrackingModule {
     }
 
     public void start() throws OpenAS2Exception {
+        startWriter();
         if (useEmbeddedDB) {
             dbHandler = new EmbeddedDBHandler();
         } else {
@@ -323,6 +407,7 @@ public class DbTrackingModule extends BaseMsgTrackingModule {
     }
 
     public void stop() {
+        stopWriter();
         dbHandler.stop();
     }
 

@@ -124,6 +124,8 @@ public class MDNSenderModule extends HttpSenderModule {
         }
         // Save sent MDN for later examination
         getSession().getProcessor().handle(StorageModule.DO_STOREMDN, msg, null);
+        // Re-track now that the MDN has been stored so the stored MDN file path is recorded
+        msg.trackMsgState(getSession());
         if (logger.isInfoEnabled()) {
             logger.info("sent MDN [" + disposition.toString() + "]" + msg.getLogMsgID());
         }
@@ -142,9 +144,13 @@ public class MDNSenderModule extends HttpSenderModule {
                 logger.debug("ASYNC MDN attempting connection to: " + url + mdn.getMessage().getLogMsgID());
             }
             long maxSize = msg.getPartnership().getNoChunkedMaxSize();
-            Map<String, Object> httpOptions = getHttpOptions();
+            Map<String, Object> httpOptions = getHttpOptions(msg.getPartnership());
             httpOptions.put(HTTPUtil.PARAM_HTTP_USER, msg.getPartnership().getAttribute(HTTPUtil.PARAM_HTTP_USER));
             httpOptions.put(HTTPUtil.PARAM_HTTP_PWD, msg.getPartnership().getAttribute(HTTPUtil.PARAM_HTTP_PWD));
+            // Mutual TLS client certificate - partnership attributes override global properties
+            httpOptions.put(HTTPUtil.PARAM_HTTPS_CLIENT_KEYSTORE, msg.getPartnership().getAttributeOrProperty(HTTPUtil.PARAM_HTTPS_CLIENT_KEYSTORE, null));
+            httpOptions.put(HTTPUtil.PARAM_HTTPS_CLIENT_KEYSTORE_PASSWORD, msg.getPartnership().getAttributeOrProperty(HTTPUtil.PARAM_HTTPS_CLIENT_KEYSTORE_PASSWORD, null));
+            httpOptions.put(HTTPUtil.PARAM_HTTPS_CLIENT_CERT_ALIAS, msg.getPartnership().getAttributeOrProperty(HTTPUtil.PARAM_HTTPS_CLIENT_CERT_ALIAS, null));
             // Convert the MimebodyPart to a string so we know how big it is to set Content-Length
             ByteArrayOutputStream dataOutputStream = new ByteArrayOutputStream();
             MimeBodyPart part = mdn.getData();

@@ -41,6 +41,7 @@ import javax.net.ssl.SSLHandshakeException;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.ObjectOutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -188,12 +189,19 @@ public class AS2SenderModule extends HttpSenderModule implements HasSchedule {
             logger.info("Connecting to: " + url + msg.getLogMsgID());
         }
 
-        Map<String, Object> httpOptions = getHttpOptions();
+        Map<String, Object> httpOptions = getHttpOptions(msg.getPartnership());
         httpOptions.put(HTTPUtil.PARAM_HTTP_USER, msg.getPartnership().getAttribute(HTTPUtil.PARAM_HTTP_USER));
         httpOptions.put(HTTPUtil.PARAM_HTTP_PWD, msg.getPartnership().getAttribute(HTTPUtil.PARAM_HTTP_PWD));
+        // Mutual TLS client certificate - partnership attributes override global properties
+        httpOptions.put(HTTPUtil.PARAM_HTTPS_CLIENT_KEYSTORE, msg.getPartnership().getAttributeOrProperty(HTTPUtil.PARAM_HTTPS_CLIENT_KEYSTORE, null));
+        httpOptions.put(HTTPUtil.PARAM_HTTPS_CLIENT_KEYSTORE_PASSWORD, msg.getPartnership().getAttributeOrProperty(HTTPUtil.PARAM_HTTPS_CLIENT_KEYSTORE_PASSWORD, null));
+        httpOptions.put(HTTPUtil.PARAM_HTTPS_CLIENT_CERT_ALIAS, msg.getPartnership().getAttributeOrProperty(HTTPUtil.PARAM_HTTPS_CLIENT_CERT_ALIAS, null));
         long maxSize = msg.getPartnership().getNoChunkedMaxSize();
         boolean preventChunking = msg.getPartnership().isPreventChunking(false);
-        ResponseWrapper resp = HTTPUtil.execRequest(HTTPUtil.Method.POST, url, ih, null, securedData.getInputStream(), httpOptions, maxSize, preventChunking);
+        ResponseWrapper resp = null;
+        try (InputStream is = securedData.getInputStream()) {
+            resp = HTTPUtil.execRequest(HTTPUtil.Method.POST, url, ih, null, is, httpOptions, maxSize, preventChunking);
+        }
         if (logger.isInfoEnabled()) {
             logger.info("Message sent and response received in " + resp.getTransferTimeMs() + msg.getLogMsgID());
         }
@@ -201,7 +209,7 @@ public class AS2SenderModule extends HttpSenderModule implements HasSchedule {
         // Check the HTTP Response code
         int rc = resp.getStatusCode();
         if ((rc != HttpURLConnection.HTTP_OK) && (rc != HttpURLConnection.HTTP_CREATED) && (rc != HttpURLConnection.HTTP_ACCEPTED) && (rc != HttpURLConnection.HTTP_PARTIAL) && (rc != HttpURLConnection.HTTP_NO_CONTENT)) {
-            msg.setLogMsg("Error sending message. URL: " + url + " ::: Response Code: " + rc + " " + resp.getStatusPhrase() + " ::: Response Message: " + resp.getBody().toString());
+            msg.setLogMsg("Error sending message. URL: " + url + " ::: Response Code: " + rc + " " + resp.getStatusPhrase() + " ::: Response Message: " + new String(resp.getBody(), java.nio.charset.StandardCharsets.UTF_8));
             logger.error(msg.getLogMsg());
             throw new HttpResponseException(url, rc, resp.getStatusPhrase());
         }
@@ -345,7 +353,8 @@ public class AS2SenderModule extends HttpSenderModule implements HasSchedule {
                 addCustomOuterMimeHeaders(msg, dataBP);
             }
             calcAndStoreMic(msg, dataBP, (sign || encrypt));
-            String x509_alias = msg.getPartnership().getAlias(Partnership.PTYPE_SENDER);
+            // Takes the fallback signing certificate if the partner has rejected the primary as unauthenticated
+            String x509_alias = AS2Util.resolveOutboundAlias(msg, Partnership.PTYPE_SENDER);
             X509Certificate senderCert = certFx.getCertificate(x509_alias);
 
             PrivateKey senderKey = certFx.getPrivateKey(x509_alias);
@@ -383,7 +392,8 @@ public class AS2SenderModule extends HttpSenderModule implements HasSchedule {
             // configured
             addCustomOuterMimeHeaders(msg, dataBP);
             String algorithm = partnership.getAttribute(Partnership.PA_ENCRYPTION_ALGORITHM);
-            String x509_alias = msg.getPartnership().getAlias(Partnership.PTYPE_RECEIVER);
+            // Takes the partner's fallback certificate if they have rejected the primary as undecryptable
+            String x509_alias = AS2Util.resolveOutboundAlias(msg, Partnership.PTYPE_RECEIVER);
             X509Certificate receiverCert = certFx.getCertificate(x509_alias);
             dataBP = AS2Util.getCryptoHelper().encrypt(dataBP, receiverCert, algorithm, contentTxfrEncoding);
 
