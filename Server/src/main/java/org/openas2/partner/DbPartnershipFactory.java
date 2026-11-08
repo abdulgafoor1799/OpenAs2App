@@ -2,8 +2,12 @@ package org.openas2.partner;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.openas2.BaseSession;
 import org.openas2.OpenAS2Exception;
 import org.openas2.Session;
+import org.openas2.cert.CertificateFactory;
+import org.openas2.cert.DbCertificateFactory;
+import org.openas2.processor.receiver.DirectoryPollingModule;
 import org.openas2.WrappedException;
 import org.openas2.XMLSession;
 import org.openas2.params.ComponentParameters;
@@ -28,8 +32,12 @@ import java.sql.SQLException;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
@@ -92,6 +100,8 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
 
     // The state currently applied, kept so a failed apply can restore the previous pollers
     private LoadedState currentState = null;
+    // Rendered poller configuration per partnership name for the pollers currently loaded
+    private Map<String, Element> currentPollers = null;
     // Version value read in the same transaction as the currently applied state (null if not tracked)
     private volatile String loadedVersion = null;
     private volatile long lastFullLoadMillis = 0;
@@ -219,48 +229,122 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
         }
     }
 
+    /**
+     * Applies a state read from the database. Poller configurations are rendered first (no side effects), then only
+     * the pollers whose rendered configuration changed are stopped and started; unchanged pollers keep running and
+     * inbound processing is never paused. If loading a new poller fails the previous pollers are restored.
+     */
     private void applyState(LoadedState state) throws OpenAS2Exception {
         Session session = getSession();
-        if (session != null) {
+        Map<String, Element> newPollers = renderPollers(state);
+        if (session == null) {
+            publish(state, newPollers);
+            return;
+        }
+        if (!initialized || currentPollers == null) {
+            // Startup: Session.start() starts the pollers once everything is wired up
             session.destroyPartnershipPollers(Session.PARTNERSHIP_POLLER);
+            for (Map.Entry<String, Element> poller : newPollers.entrySet()) {
+                session.loadPartnershipPoller(poller.getValue(), poller.getKey(), Session.PARTNERSHIP_POLLER);
+            }
+            publish(state, newPollers);
+            return;
+        }
+        Set<String> toStop = new HashSet<String>();
+        Set<String> toStart = new HashSet<String>();
+        for (Map.Entry<String, Element> old : currentPollers.entrySet()) {
+            Element replacement = newPollers.get(old.getKey());
+            if (replacement == null || !signature(replacement).equals(signature(old.getValue()))) {
+                toStop.add(old.getKey());
+            }
+        }
+        for (Map.Entry<String, Element> poller : newPollers.entrySet()) {
+            Element previous = currentPollers.get(poller.getKey());
+            if (previous == null || !signature(previous).equals(signature(poller.getValue()))) {
+                toStart.add(poller.getKey());
+            }
+        }
+        // Stop first so a poller moving between partnerships never has two owners of one outbox directory
+        for (String name : toStop) {
+            session.destroyPartnershipPoller(name);
         }
         try {
-            launchPartnershipPollers(state);
-        } catch (OpenAS2Exception e) {
-            logger.error("Failed to apply the partnership poller configuration read from the database, restoring the previous configuration: " + e.getMessage(), e);
-            if (session != null) {
-                session.destroyPartnershipPollers(Session.PARTNERSHIP_POLLER);
+            for (String name : toStart) {
+                session.loadPartnershipPoller(newPollers.get(name), name, Session.PARTNERSHIP_POLLER);
             }
-            if (currentState != null) {
+        } catch (OpenAS2Exception e) {
+            logger.error("Failed to apply the partnership poller configuration read from the database, restoring the previous pollers: " + e.getMessage(), e);
+            for (String name : toStart) {
+                session.destroyPartnershipPoller(name);
+            }
+            for (String name : toStop) {
                 try {
-                    launchPartnershipPollers(currentState);
+                    session.loadPartnershipPoller(currentPollers.get(name), name, Session.PARTNERSHIP_POLLER);
                 } catch (OpenAS2Exception re) {
-                    logger.error("Failed to restore the previous partnership pollers: " + re.getMessage(), re);
+                    logger.error("Failed to restore the previous poller for partnership " + name + ": " + re.getMessage(), re);
                 }
             }
-            if (initialized && session != null) {
-                session.startPartnershipPollers();
-            }
+            startStoppedPollers(session);
             throw e;
         }
+        publish(state, newPollers);
+        startStoppedPollers(session);
+        if (logger.isInfoEnabled()) {
+            logger.info("Partnership pollers: " + (newPollers.size() - toStart.size()) + " kept running, "
+                    + toStart.size() + " (re)started, " + (toStop.size() - countIn(toStop, toStart)) + " removed");
+        }
+    }
+
+    private static int countIn(Set<String> names, Set<String> other) {
+        int n = 0;
+        for (String name : names) {
+            if (other.contains(name)) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private void publish(LoadedState state, Map<String, Element> pollers) {
         synchronized (this) {
             this.partners = state.partners;
             setPartnerships(state.partnerships);
             this.currentState = state;
+            this.currentPollers = pollers;
             this.loadedVersion = state.version;
             this.lastFullLoadMillis = System.currentTimeMillis();
         }
-        // At startup Session.start() starts the pollers once everything is wired up; for
-        // runtime refreshes the destroy/reload above leaves them stopped so restart them here
-        if (initialized && session != null) {
+    }
+
+    /** Starts the partnership pollers that are loaded but not running, leaving running ones untouched. */
+    private void startStoppedPollers(Session session) throws OpenAS2Exception {
+        if (!(session instanceof BaseSession)) {
             session.startPartnershipPollers();
+            return;
+        }
+        for (Map<String, Object> meta : ((BaseSession) session).getPolledDirectories().values()) {
+            Object poller = meta.get("pollerInstance");
+            if (Session.PARTNERSHIP_POLLER.equals(meta.get("configSource")) && poller instanceof DirectoryPollingModule
+                    && !((DirectoryPollingModule) poller).isRunning()) {
+                ((DirectoryPollingModule) poller).start();
+            }
         }
     }
 
-    private void launchPartnershipPollers(LoadedState state) throws OpenAS2Exception {
+    private Map<String, Element> renderPollers(LoadedState state) throws OpenAS2Exception {
+        Map<String, Element> pollers = new LinkedHashMap<String, Element>();
         for (Map.Entry<Partnership, Map<String, String>> entry : state.pollerConfigs) {
-            launchPartnershipPoller(entry.getKey(), entry.getValue());
+            Element element = renderPoller(entry.getKey(), entry.getValue());
+            if (element != null) {
+                pollers.put(entry.getKey().getName(), element);
+            }
         }
+        return pollers;
+    }
+
+    /** A stable string of the rendered poller attributes, used to detect configuration changes. */
+    private static String signature(Element element) {
+        return new TreeMap<String, String>(XMLUtil.mapAttributes(element)).toString();
     }
 
     private String getVersionQuery() throws InvalidParameterException {
@@ -311,8 +395,28 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
             }
             logger.info("Partnership version changed from " + loadedVersion + " to " + version + ", reloading partnerships");
         }
+        refreshCertificatesFirst();
         refresh();
         return true;
+    }
+
+    /**
+     * A partner and its certificate are usually written in one transaction. Checking the certificate store before
+     * applying new partnerships makes the certificates available no later than the partnerships that use them.
+     */
+    private void refreshCertificatesFirst() {
+        Session session = getSession();
+        if (session == null) {
+            return;
+        }
+        try {
+            CertificateFactory cf = session.getCertificateFactory(CertificateFactory.COMPID_AS2_CERTIFICATE_FACTORY);
+            if (cf instanceof DbCertificateFactory) {
+                ((DbCertificateFactory) cf).refreshIfChanged();
+            }
+        } catch (Exception e) {
+            logger.warn("Certificate refresh before applying partnership changes failed, continuing with the current keystore: " + e.getMessage());
+        }
     }
 
     // Keyed by partner ID so partnerships can resolve their sender/receiver rows
@@ -433,13 +537,13 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
     }
 
     /**
-     * Registers a directory poller for a partnership by merging its "pollerConfig" category
+     * Renders the directory poller configuration for a partnership by merging its "pollerConfig" category
      * attributes over the base poller config from config.xml, mirroring the pollerConfig
      * element support of the XML partnerships file.
      */
-    private void launchPartnershipPoller(Partnership partnership, Map<String, String> pollerConfig) throws OpenAS2Exception {
+    private Element renderPoller(Partnership partnership, Map<String, String> pollerConfig) throws OpenAS2Exception {
         if (!"true".equalsIgnoreCase(pollerConfig.get("enabled"))) {
-            return;
+            return null;
         }
         if (isPartnershipPollingDisabled()) {
             /*
@@ -449,12 +553,14 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
             if (logger.isDebugEnabled()) {
                 logger.debug("Partnership polling is globally disabled so no poller was started for partnership: " + partnership.getName());
             }
-            return;
+            return null;
         }
         Session session = getSession();
         if (!(session instanceof XMLSession)) {
-            logger.warn("Cannot launch a partnership poller without a session for partnership: " + partnership.getName());
-            return;
+            if (session != null) {
+                logger.warn("Cannot launch a partnership poller without an XML session for partnership: " + partnership.getName());
+            }
+            return null;
         }
         if (logger.isTraceEnabled()) {
             logger.trace("Found partnership poller for partnership: " + partnership.getName());
@@ -480,7 +586,7 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
         });
         // replace the $partnership.* placeholders
         replacePartnershipPlaceHolders(pollerDoc, partnership);
-        session.loadPartnershipPoller(pollerConfigElem, partnership.getName(), Session.PARTNERSHIP_POLLER);
+        return pollerConfigElem;
     }
 
     /**

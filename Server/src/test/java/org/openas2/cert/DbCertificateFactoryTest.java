@@ -219,55 +219,12 @@ public class DbCertificateFactoryTest {
         assertThrows(CertificateNotFoundException.class, () -> factory.getCertificate("old_expired"));
     }
 
-    // ---- startup validation failures ----
+    // ---- fatal problems: the database or our own keys -> startup fails ----
 
     @Test
-    public void startupFailsWhenAPartnerAliasHasNoCertificate() throws Exception {
-        exec("INSERT INTO partner (ID, NAME) VALUES (3, 'SUPPLIER')");
-        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (3, 'x509_alias', 'supplier_key')");
-        assertStartupFails("\"supplier_key\"");
-    }
-
-    @Test
-    public void startupFailsWhenTablesAreEmpty() throws Exception {
+    public void startupFailsWhenThereAreNoOwnKeys() throws Exception {
         exec("DELETE FROM as2_own_key");
-        exec("DELETE FROM as2_partner_certificate");
-        assertStartupFails("\"own\"");
-    }
-
-    @Test
-    public void startupFailsWhenAPartnerHasNoAlias() throws Exception {
-        exec("INSERT INTO partner (ID, NAME) VALUES (3, 'NO_ALIAS')");
-        assertStartupFails("partner \"NO_ALIAS\" has no x509_alias");
-    }
-
-    @Test
-    public void startupFailsWhenAPartnershipOverrideAliasIsMissing() throws Exception {
-        exec("INSERT INTO partnership_attribute (PARTNERSHIP_ID, CATEGORY, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (1, 'sender', 'x509_alias', 'own_2027')");
-        assertStartupFails("\"own_2027\"");
-    }
-
-    @Test
-    public void startupFailsWhenAFallbackAliasIsMissing() throws Exception {
-        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (1, 'x509_alias_fallback', 'own_previous')");
-        assertStartupFails("x509_alias_fallback \"own_previous\"");
-    }
-
-    @Test
-    public void fallbackAliasResolvesToAnOwnKey() throws Exception {
-        insertOwnKey("own_previous", encryptedPem(otherKeys, KEY_PASSWORD), pem(otherCert));
-        exec("INSERT INTO partnership_attribute (PARTNERSHIP_ID, CATEGORY, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (2, 'receiver', 'x509_alias_fallback', 'own_previous')");
-        newFactory();
-        assertEquals(otherKeys.getPrivate(), factory.getPrivateKey("own_previous"));
-    }
-
-    @Test
-    public void startupFailsWhenNoSideOfAPartnershipHasAPrivateKey() throws Exception {
-        insertPartnerCert("retailer2", pem(otherCert), true);
-        exec("INSERT INTO partner (ID, NAME) VALUES (3, 'RETAILER2')");
-        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (3, 'x509_alias', 'retailer2')");
-        exec("INSERT INTO partnership (ID, NAME, SENDER_PARTNER_ID, RECEIVER_PARTNER_ID) VALUES (3, 'RETAILER-to-RETAILER2', 2, 3)");
-        assertStartupFails("neither the sender");
+        assertStartupFails("no enabled own key pairs");
     }
 
     @Test
@@ -296,9 +253,10 @@ public class DbCertificateFactoryTest {
     }
 
     @Test
-    public void startupFailsForExpiredCertificate() throws Exception {
-        exec("UPDATE as2_partner_certificate SET CERT_PEM = '" + pem(expiredCert) + "' WHERE ALIAS = 'retailer'");
-        assertStartupFails("certificate expired");
+    public void startupFailsForBrokenOwnCertificateChain() throws Exception {
+        exec("DELETE FROM as2_own_key");
+        insertOwnKey("own", encryptedPem(ownKeys, KEY_PASSWORD), pem(ownCert) + pem(otherCert));
+        assertStartupFails("is not signed by chain certificate");
     }
 
     @Test
@@ -308,22 +266,114 @@ public class DbCertificateFactoryTest {
     }
 
     @Test
-    public void startupFailsWhenPartnerRowContainsAPrivateKey() throws Exception {
-        exec("UPDATE as2_partner_certificate SET CERT_PEM = '" + pem(retailerCert) + encryptedPem(retailerKeys, "x") + "' WHERE ALIAS = 'retailer'");
-        assertStartupFails("contains private key material");
+    public void startupFailsWhenTheDatabaseCannotBeRead() throws Exception {
+        exec("ALTER TABLE as2_own_key RENAME TO moved_away");
+        assertThrows(Exception.class, this::newFactory);
+    }
+
+    // ---- partner level problems: reported, the rest of the keystore loads (stock OpenAS2 behaviour) ----
+
+    private void assertReported(String expectedText) {
+        boolean found = false;
+        for (String problem : factory.getLoadProblems()) {
+            found |= problem.contains(expectedText);
+        }
+        assertTrue(found, "expected a problem containing \"" + expectedText + "\" in " + factory.getLoadProblems());
     }
 
     @Test
-    public void startupFailsForBrokenCertificateChain() throws Exception {
+    public void partnerWithoutCertificateIsReportedNotFatal() throws Exception {
+        exec("INSERT INTO partner (ID, NAME) VALUES (3, 'RITHUM')");
+        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (3, 'x509_alias', 'rithumas2')");
+        exec("INSERT INTO partnership (ID, NAME, SENDER_PARTNER_ID, RECEIVER_PARTNER_ID) VALUES (3, 'OWN-to-RITHUM', 1, 3)");
+        newFactory();
+        assertReported("\"rithumas2\"");
+        // Everything else still works
+        assertEquals(retailerCert, factory.getCertificate("retailer"));
+        assertEquals(ownKeys.getPrivate(), factory.getPrivateKey("own"));
+        assertThrows(CertificateNotFoundException.class, () -> factory.getCertificate("rithumas2"));
+    }
+
+    @Test
+    public void expiredPartnerCertificateIsLoadedAndReported() throws Exception {
+        exec("UPDATE as2_partner_certificate SET CERT_PEM = '" + pem(expiredCert) + "' WHERE ALIAS = 'retailer'");
+        newFactory();
+        assertReported("certificate expired");
+        assertEquals(expiredCert, factory.getCertificate("retailer"));
+    }
+
+    @Test
+    public void expiredOwnCertificateIsLoadedAndReported() throws Exception {
         exec("DELETE FROM as2_own_key");
-        insertOwnKey("own", encryptedPem(ownKeys, KEY_PASSWORD), pem(ownCert) + pem(otherCert));
-        assertStartupFails("is not signed by chain certificate");
+        insertOwnKey("own", encryptedPem(otherKeys, KEY_PASSWORD), pem(expiredCert));
+        newFactory();
+        assertReported("certificate expired");
+        assertEquals(otherKeys.getPrivate(), factory.getPrivateKey("own"));
     }
 
     @Test
-    public void startupFailsForUnparsablePartnerCertificate() throws Exception {
+    public void partnerWithoutAliasIsReported() throws Exception {
+        exec("INSERT INTO partner (ID, NAME) VALUES (3, 'NO_ALIAS')");
+        newFactory();
+        assertReported("partner \"NO_ALIAS\" has no x509_alias");
+    }
+
+    @Test
+    public void missingPartnershipOverrideAliasIsReported() throws Exception {
+        exec("INSERT INTO partnership_attribute (PARTNERSHIP_ID, CATEGORY, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (1, 'sender', 'x509_alias', 'own_2027')");
+        newFactory();
+        assertReported("\"own_2027\"");
+    }
+
+    @Test
+    public void missingFallbackAliasIsReported() throws Exception {
+        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (1, 'x509_alias_fallback', 'own_previous')");
+        newFactory();
+        assertReported("x509_alias_fallback \"own_previous\"");
+    }
+
+    @Test
+    public void fallbackAliasResolvesToAnOwnKey() throws Exception {
+        insertOwnKey("own_previous", encryptedPem(otherKeys, KEY_PASSWORD), pem(otherCert));
+        exec("INSERT INTO partnership_attribute (PARTNERSHIP_ID, CATEGORY, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (2, 'receiver', 'x509_alias_fallback', 'own_previous')");
+        newFactory();
+        assertEquals(otherKeys.getPrivate(), factory.getPrivateKey("own_previous"));
+        assertTrue(factory.getLoadProblems().isEmpty(), factory.getLoadProblems().toString());
+    }
+
+    @Test
+    public void ownSideFallbackMustBeAnOwnKey() throws Exception {
+        insertPartnerCert("not_ours", pem(otherCert), true);
+        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (1, 'x509_alias_fallback', 'not_ours')");
+        newFactory();
+        assertReported("is a partner certificate but the primary x509_alias \"own\" is an own key");
+    }
+
+    @Test
+    public void partnershipWithoutAPrivateKeyIsReported() throws Exception {
+        insertPartnerCert("retailer2", pem(otherCert), true);
+        exec("INSERT INTO partner (ID, NAME) VALUES (3, 'RETAILER2')");
+        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (3, 'x509_alias', 'retailer2')");
+        exec("INSERT INTO partnership (ID, NAME, SENDER_PARTNER_ID, RECEIVER_PARTNER_ID) VALUES (3, 'RETAILER-to-RETAILER2', 2, 3)");
+        newFactory();
+        assertReported("neither the sender");
+    }
+
+    @Test
+    public void partnerRowWithPrivateKeyIsSkipped() throws Exception {
+        exec("UPDATE as2_partner_certificate SET CERT_PEM = '" + pem(retailerCert) + encryptedPem(retailerKeys, "x") + "' WHERE ALIAS = 'retailer'");
+        newFactory();
+        assertReported("contains private key material");
+        assertThrows(CertificateNotFoundException.class, () -> factory.getCertificate("retailer"));
+        assertEquals(ownKeys.getPrivate(), factory.getPrivateKey("own"));
+    }
+
+    @Test
+    public void unparsablePartnerCertificateIsSkippedAtStartup() throws Exception {
         exec("UPDATE as2_partner_certificate SET CERT_PEM = '-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----' WHERE ALIAS = 'retailer'");
-        assertStartupFails("cannot be parsed");
+        newFactory();
+        assertReported("cannot be parsed");
+        assertThrows(CertificateNotFoundException.class, () -> factory.getCertificate("retailer"));
     }
 
     // ---- reloads ----
@@ -348,19 +398,55 @@ public class DbCertificateFactoryTest {
     }
 
     @Test
-    public void invalidReloadKeepsTheCurrentKeystore() throws Exception {
+    public void unparsableUpdateKeepsTheCertificateAlreadyLoaded() throws Exception {
+        newFactory();
+        exec("UPDATE as2_partner_certificate SET CERT_PEM = 'garbage' WHERE ALIAS = 'retailer'");
+        bumpVersion();
+        assertTrue(factory.refreshIfChanged());
+        assertReported("keeping the certificate already loaded");
+        assertEquals(retailerCert, factory.getCertificate("retailer"));
+    }
+
+    @Test
+    public void ownKeyProblemOnReloadKeepsTheCurrentKeystore() throws Exception {
         newFactory();
         KeyStore before = factory.getKeyStore();
-        exec("UPDATE as2_partner_certificate SET CERT_PEM = 'garbage' WHERE ALIAS = 'retailer'");
+        exec("UPDATE as2_own_key SET CERT_CHAIN_PEM = '" + pem(otherCert) + "' WHERE ALIAS = 'own'");
         bumpVersion();
 
         assertThrows(DbCertificateFactory.CertificateValidationException.class, () -> factory.refreshIfChanged());
         assertSame(before, factory.getKeyStore());
-        assertEquals(retailerCert, factory.getCertificate("retailer"));
+        assertEquals(ownCert, factory.getCertificate("own"));
 
-        exec("UPDATE as2_partner_certificate SET CERT_PEM = '" + pem(retailerCert) + "' WHERE ALIAS = 'retailer'");
+        exec("UPDATE as2_own_key SET CERT_CHAIN_PEM = '" + pem(ownCert) + "' WHERE ALIAS = 'own'");
         bumpVersion();
         assertTrue(factory.refreshIfChanged());
+    }
+
+    @Test
+    public void trustStoreModeLoadsCertificatesOnly() throws Exception {
+        exec("CREATE TABLE as2_ssl_trusted_ca (ALIAS VARCHAR(255) PRIMARY KEY, CERT_PEM CLOB NOT NULL, ENABLED BOOLEAN DEFAULT TRUE NOT NULL)");
+        exec("INSERT INTO as2_ssl_trusted_ca (ALIAS, CERT_PEM) VALUES ('partner_https_ca', '" + pem(otherCert) + "')");
+        DbCertificateFactory trust = new DbCertificateFactory();
+        Map<String, String> params = new HashMap<String, String>();
+        params.put(DbCertificateFactory.PARAM_IDENTIFIER, "ssl_trust_certs");
+        params.put(DbCertificateFactory.PARAM_PASSWORD, STORE_PASSWORD);
+        params.put(DbCertificateFactory.PARAM_USE_EMBEDDED_DB, "true");
+        params.put("tcp_server_start", "false");
+        params.put(DbCertificateFactory.PARAM_DB_USER, "sa");
+        params.put(DbCertificateFactory.PARAM_DB_PWD, "");
+        params.put(DbCertificateFactory.PARAM_JDBC_CONNECT_STRING, connectString);
+        params.put(DbCertificateFactory.PARAM_OWN_KEY_QUERY, "");
+        params.put(DbCertificateFactory.PARAM_PARTNER_CERT_QUERY, "SELECT ALIAS, CERT_PEM FROM as2_ssl_trusted_ca WHERE ENABLED = TRUE");
+        params.put(DbCertificateFactory.PARAM_VALIDATE_PARTNER_ALIASES, "false");
+        trust.init(null, params);
+        try {
+            assertEquals(otherCert, trust.getCertificate("partner_https_ca"));
+            assertEquals(1, trust.getKeyStore().size());
+            assertTrue(trust.getLoadProblems().isEmpty());
+        } finally {
+            trust.destroy();
+        }
     }
 
     @Test

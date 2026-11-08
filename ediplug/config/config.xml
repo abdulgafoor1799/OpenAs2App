@@ -99,7 +99,6 @@
                  identifier="as2_certs"
                  password="$properties.as2_keystore_password$"
                  private_key_password="$properties.as2_key_encryption_password$"
-                 fail_on_expired="$properties.as2_certs.fail_on_expired$"
                  expiry_warning_days="$properties.as2_certs.expiry_warning_days$"
                  db_user="$properties.as2_db.user$"
                  db_pwd="$properties.as2_db.password$"
@@ -109,12 +108,22 @@
                  version_query="$properties.as2_certs.version_query$"
                  full_refresh_interval="$properties.as2_certs.full_refresh_interval$"
                  interval="$properties.as2_certs.polling.interval$"/>
-   <certificates enabled="$properties.ssl_trust_keystore.enabled$"
-                 classname="org.openas2.cert.PKCS12CertificateFactory"
+   <!-- EDIPLUG: extra certificates trusted for outbound HTTPS to partners, from the as2_ssl_trusted_ca table.
+        Used in addition to the JVM trust store. No keystore file. -->
+   <certificates classname="org.openas2.cert.DbCertificateFactory"
                  identifier="ssl_trust_certs"
-                 filename="$properties.ssl_trust_keystore$"
-                 password="$properties.ssl_trust_keystore_password$"
-                 interval="$properties.ssl_trust_keystore.refresh_interval$"/>
+                 password="$properties.as2_keystore_password$"
+                 own_key_query=""
+                 partner_cert_query="SELECT ALIAS, CERT_PEM FROM as2_ssl_trusted_ca WHERE ENABLED = TRUE ORDER BY ALIAS"
+                 validate_partner_aliases="false"
+                 db_user="$properties.as2_db.user$"
+                 db_pwd="$properties.as2_db.password$"
+                 jdbc_connect_string="$properties.as2_db.url$"
+                 jdbc_driver="org.postgresql.Driver"
+                 force_load_jdbc_driver="true"
+                 version_query="$properties.ssl_trust.version_query$"
+                 full_refresh_interval="$properties.as2_certs.full_refresh_interval$"
+                 interval="$properties.as2_certs.polling.interval$"/>
    <commands classname="org.openas2.cmd.XMLCommandRegistry"
              filename="%home%/commands.xml"/>
    <commandProcessors>
