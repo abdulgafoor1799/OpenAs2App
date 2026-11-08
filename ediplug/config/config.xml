@@ -250,6 +250,8 @@
                  jdbc_connect_string="$properties.as2_db.url$"
                  jdbc_driver="org.postgresql.Driver"
                  force_load_jdbc_driver="true"
+                 version_query="$properties.partnerships.version_query$"
+                 full_refresh_interval="$properties.partnerships.full_refresh_interval$"
                  interval="$properties.partnerships.polling.interval$"/>
    <!-- Alternatively partnerships can be loaded (read-only) from a database using the
         partner/partner_attribute/partnership/partnership_attribute tables

@@ -1,5 +1,5 @@
 -- V1: partnership store for org.openas2.partner.DbPartnershipFactory (PostgreSQL) + 4.15 tracking columns.
--- Run against the openas2 database as a superuser / RDS master user:
+-- Run against the OpenAS2 database (openas2) as a superuser / RDS master user:
 --   psql -v ON_ERROR_STOP=1 -d openas2 -f V1__partnership_tables.sql
 -- Idempotent. Role passwords are NOT set here: set them afterwards with \password <role>.
 --
@@ -20,7 +20,11 @@ BEGIN
 END
 $$;
 
-GRANT CONNECT ON DATABASE openas2 TO as2_config_admin, openas2;
+DO $$
+BEGIN
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO as2_config_admin, openas2', current_database());
+END
+$$;
 GRANT USAGE ON SCHEMA public TO as2_config_admin, openas2;
 GRANT CREATE ON SCHEMA public TO as2_config_admin;
 
