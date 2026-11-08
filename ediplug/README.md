@@ -5,9 +5,10 @@ OpenAS2 4.15 with EDIPLUG's configuration baked into the image. Runtime data liv
 | What | Where | Who writes it | How OpenAS2 picks up changes |
 |---|---|---|---|
 | Static config (`config.xml`, `openas2.properties`, `logback.xml`, CA certs) | `ediplug/config/` → image `config_template` | this repo | rebuild image |
-| Partners and partnerships | tables `partner`, `partner_attribute`, `partnership`, `partnership_attribute` | EDIPLUG backend | version counter polled every 10s |
-| Key pairs of the AS2 IDs we host (own IDs, operated suppliers, test IDs) | table `as2_own_key` (private key as encrypted PKCS#8 PEM + cert chain) | EDIPLUG backend | version counter polled every 10s |
-| Partner (retailer) public certificates | table `as2_partner_certificate` | EDIPLUG backend | version counter polled every 10s |
+| Partners and partnerships | tables `partner`, `partner_attribute`, `partnership`, `partnership_attribute` | EDIPLUG backend | version counter polled every 30s |
+| Key pairs of the AS2 IDs we host (own IDs, operated suppliers, test IDs) | table `as2_own_key` (private key as encrypted PKCS#8 PEM + cert chain) | EDIPLUG backend | version counter polled every 30s |
+| Partner (retailer) public certificates | table `as2_partner_certificate` | EDIPLUG backend | version counter polled every 30s |
+| Extra CAs trusted for outbound HTTPS to partners | table `as2_ssl_trusted_ca` | EDIPLUG backend | version counter polled every 30s |
 | Secrets (DB password, key-encryption passphrase, keystore password, SMTP) | environment variables | ops | container restart |
 
 OpenAS2 only **reads** these tables (DB role `openas2` has `SELECT` only); its partner/partnership/cert
@@ -54,6 +55,7 @@ psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/V1__partnership_tables.sql
 psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/V2__config_version.sql
 psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/V3__partner_certificates.sql
 psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/V4__own_keys.sql
+psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/V5__ssl_trusted_ca.sql
 psql -d openas2 -c '\password openas2'            # runtime role
 psql -d openas2 -c '\password as2_config_admin'   # backend / migrations role
 ```
@@ -80,14 +82,30 @@ Partner certificates: export the PEM (`keytool -exportcert -rfc ...`) and insert
 
 ## Validation (startup and every reload)
 
-The factory reads both certificate tables and the partner tables in one snapshot and checks:
-own keys are encrypted, decrypt, match their certificate and have a valid chain; partner rows hold a parseable
-public certificate only; no certificate is expired or not yet valid (`fail_on_expired`); aliases are unique
-across both tables; every partner `x509_alias` and every partnership sender/receiver override resolves to an
-enabled row; every partnership has a private key on at least one side. Expiring within 30 days, small RSA keys,
-duplicate certificates and unreferenced rows are warnings. All errors are logged together; at startup the server
-exits, on a reload the current keystore stays in use. The database also rejects an alias present in both tables,
-unencrypted private keys and private key material in partner rows.
+The factory reads the certificate tables and the partner tables in one snapshot.
+
+**Fatal** (startup stops; a reload keeps the current keystore): the database cannot be read; an own key is
+unencrypted, cannot be decrypted, does not match its certificate or has a broken chain; an alias is in both tables;
+`as2_own_key` has no enabled rows.
+
+**Partner level** (logged, only that partner's traffic fails per message - stock OpenAS2 behaviour): a partner
+certificate that cannot be parsed or contains a private key is skipped (on a reload the certificate already loaded
+for the alias is kept); a partner / partnership / `x509_alias_fallback` alias with no certificate; a partner without
+`x509_alias`; a partnership with no private key on either side; a fallback of a different kind than its primary
+(own key vs partner certificate); expired or not-yet-valid certificates (still loaded: OpenAS2 itself rejects
+signatures from an expired partner certificate unless `as2_sign_allow_expired_certificate=true`). These are logged
+at ERROR when first seen and at WARN while they persist.
+
+Warnings: expiring within 30 days, RSA < 2048 bits, duplicate certificates, rows not referenced by any partner.
+The database also rejects an alias present in both tables, unencrypted private keys and private key material in
+partner rows.
+
+## Reloads
+
+Every 30s each factory reads only its version counter. On a change:
+- certificates: a new keystore is built, validated and swapped in; nothing is paused;
+- partnerships: the certificate store is checked first (so a partner and its key written in one transaction go live
+  together), then only outbox pollers whose configuration changed are restarted; receiving is never paused.
 
 ## Adding an own key pair (what the backend does for a new supplier)
 
