@@ -90,11 +90,21 @@
                messages.enabled="false"
                messages.polling.interval="120"
              />
-   <certificates classname="org.openas2.cert.PKCS12CertificateFactory"
+   <!-- EDIPLUG: the AS2 keystore is built in memory from our own key pairs (own_keys.p12, mounted as a secret)
+        and partner public certificates in the as2_partner_certificate table (owned by the EDIPLUG backend).
+        Read-only: certificate import/delete commands are rejected. -->
+   <certificates classname="org.openas2.cert.DbCertificateFactory"
                  identifier="as2_certs"
-                 filename="$properties.as2_keystore$"
+                 own_keys_file="$properties.as2_own_keys_file$"
                  password="$properties.as2_keystore_password$"
-                 interval="$properties.as2_keystore.refresh_interval$"/>
+                 db_user="$properties.as2_db.user$"
+                 db_pwd="$properties.as2_db.password$"
+                 jdbc_connect_string="$properties.as2_db.url$"
+                 jdbc_driver="org.postgresql.Driver"
+                 force_load_jdbc_driver="true"
+                 version_query="$properties.as2_certs.version_query$"
+                 full_refresh_interval="$properties.as2_certs.full_refresh_interval$"
+                 interval="$properties.as2_certs.polling.interval$"/>
    <certificates enabled="$properties.ssl_trust_keystore.enabled$"
                  classname="org.openas2.cert.PKCS12CertificateFactory"
                  identifier="ssl_trust_certs"
