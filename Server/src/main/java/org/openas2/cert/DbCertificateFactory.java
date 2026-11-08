@@ -210,8 +210,15 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
             logger.warn("Keystore " + getIdentifier() + ": " + warning);
         }
         if (!findings.errors.isEmpty()) {
+            // ERROR (which may trigger alert emails) only for the first failure; scheduled retries of the same
+            // broken data are logged as warnings until a reload succeeds
+            boolean repeatedFailure = consecutiveFailures > 0;
             for (String error : findings.errors) {
-                logger.error("Keystore " + getIdentifier() + ": " + error);
+                if (repeatedFailure) {
+                    logger.warn("Keystore " + getIdentifier() + ": " + error);
+                } else {
+                    logger.error("Keystore " + getIdentifier() + ": " + error);
+                }
             }
             throw new CertificateValidationException(findings.errors);
         }
