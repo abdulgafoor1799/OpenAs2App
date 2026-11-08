@@ -78,8 +78,8 @@ import java.util.concurrent.TimeUnit;
  * otherwise a warning); expiring within "expiry_warning_days" (default 30) is a warning; RSA keys below 2048 bits
  * are a warning;</li>
  * <li>aliases are unique across both tables (case-insensitively, as PKCS12 aliases are case-insensitive);</li>
- * <li>every partner's x509_alias, and every per-partnership sender/receiver x509_alias override, resolves to an
- * enabled entry in one of the two tables;</li>
+ * <li>every partner's x509_alias, every per-partnership sender/receiver x509_alias override, and every
+ * x509_alias_fallback (certificate rollover) resolves to an enabled entry in one of the two tables;</li>
  * <li>every partnership has a private key for at least one side (otherwise it can neither sign/decrypt nor
  * receive);</li>
  * <li>certificates not referenced by any partner are a warning.</li>
@@ -103,6 +103,7 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
     public static final String PARAM_PARTNER_CERT_QUERY = "partner_cert_query";
     public static final String PARAM_PARTNER_ALIAS_QUERY = "partner_alias_query";
     public static final String PARAM_PARTNERSHIP_ALIAS_QUERY = "partnership_alias_query";
+    public static final String PARAM_FALLBACK_ALIAS_QUERY = "fallback_alias_query";
     public static final String PARAM_VALIDATE_PARTNER_ALIASES = "validate_partner_aliases";
     public static final String PARAM_FAIL_ON_EXPIRED = "fail_on_expired";
     public static final String PARAM_EXPIRY_WARNING_DAYS = "expiry_warning_days";
@@ -131,6 +132,16 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
             + " LEFT JOIN partnership_attribute so ON so.PARTNERSHIP_ID = ps.ID AND so.CATEGORY = 'sender' AND so.ATTRIBUTE_NAME = 'x509_alias'"
             + " LEFT JOIN partnership_attribute ro ON ro.PARTNERSHIP_ID = ps.ID AND ro.CATEGORY = 'receiver' AND ro.ATTRIBUTE_NAME = 'x509_alias'"
             + " ORDER BY ps.NAME";
+    /**
+     * Every x509_alias_fallback (certificate rollover alias, tried by the receiver when decryption or signature
+     * verification with x509_alias fails), on partners and as partnership sender/receiver overrides.
+     */
+    public static final String DEFAULT_FALLBACK_ALIAS_QUERY =
+            "SELECT p.NAME, a.ATTRIBUTE_VALUE FROM partner p"
+            + " JOIN partner_attribute a ON a.PARTNER_ID = p.ID AND a.ATTRIBUTE_NAME = 'x509_alias_fallback'"
+            + " UNION ALL SELECT ps.NAME, pa.ATTRIBUTE_VALUE FROM partnership ps"
+            + " JOIN partnership_attribute pa ON pa.PARTNERSHIP_ID = ps.ID AND pa.CATEGORY IN ('sender', 'receiver')"
+            + " AND pa.ATTRIBUTE_NAME = 'x509_alias_fallback'";
 
     private static final String READ_ONLY_MSG =
             "Certificates are managed in the database (as2_own_key / as2_partner_certificate); the keystore is read-only";
@@ -165,6 +176,7 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
         final Map<String, String> partnerCerts = new LinkedHashMap<String, String>();  // alias -> cert pem
         final Map<String, String> partnerAliases = new LinkedHashMap<String, String>(); // partner -> x509_alias
         final List<String[]> partnershipAliases = new ArrayList<String[]>();           // {name, sender alias, receiver alias}
+        final List<String[]> fallbackAliases = new ArrayList<String[]>();              // {partner or partnership, alias}
     }
 
     /** Messages collected while validating; errors fail the load, warnings are only logged. */
@@ -254,6 +266,12 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
                          ResultSet rs = s.executeQuery()) {
                         while (rs.next()) {
                             snapshot.partnershipAliases.add(new String[]{rs.getString(1), rs.getString(2), rs.getString(3)});
+                        }
+                    }
+                    try (PreparedStatement s = conn.prepareStatement(getParameter(PARAM_FALLBACK_ALIAS_QUERY, DEFAULT_FALLBACK_ALIAS_QUERY));
+                         ResultSet rs = s.executeQuery()) {
+                        while (rs.next()) {
+                            snapshot.fallbackAliases.add(new String[]{rs.getString(1), rs.getString(2)});
                         }
                     }
                 }
@@ -431,6 +449,17 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
                     && aliasOwner.containsKey(ps[2].toLowerCase(Locale.ROOT)) && !senderOwn && !receiverOwn) {
                 findings.errors.add("partnership \"" + name + "\": neither the sender (\"" + ps[1] + "\") nor the receiver (\""
                         + ps[2] + "\") has a private key in as2_own_key, so this server can neither send nor receive it");
+            }
+        }
+        for (String[] fallback : snapshot.fallbackAliases) {
+            String alias = fallback[1];
+            if (alias == null || alias.trim().isEmpty()) {
+                continue;
+            }
+            referenced.add(alias.toLowerCase(Locale.ROOT));
+            if (!aliasOwner.containsKey(alias.toLowerCase(Locale.ROOT))) {
+                findings.errors.add("\"" + fallback[0] + "\" uses x509_alias_fallback \"" + alias
+                        + "\" but there is no enabled row for it in as2_own_key or as2_partner_certificate");
             }
         }
         for (String owner : aliasOwner.values()) {

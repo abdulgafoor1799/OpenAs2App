@@ -248,6 +248,20 @@ public class DbCertificateFactoryTest {
     }
 
     @Test
+    public void startupFailsWhenAFallbackAliasIsMissing() throws Exception {
+        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (1, 'x509_alias_fallback', 'own_previous')");
+        assertStartupFails("x509_alias_fallback \"own_previous\"");
+    }
+
+    @Test
+    public void fallbackAliasResolvesToAnOwnKey() throws Exception {
+        insertOwnKey("own_previous", encryptedPem(otherKeys, KEY_PASSWORD), pem(otherCert));
+        exec("INSERT INTO partnership_attribute (PARTNERSHIP_ID, CATEGORY, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (2, 'receiver', 'x509_alias_fallback', 'own_previous')");
+        newFactory();
+        assertEquals(otherKeys.getPrivate(), factory.getPrivateKey("own_previous"));
+    }
+
+    @Test
     public void startupFailsWhenNoSideOfAPartnershipHasAPrivateKey() throws Exception {
         insertPartnerCert("retailer2", pem(otherCert), true);
         exec("INSERT INTO partner (ID, NAME) VALUES (3, 'RETAILER2')");
