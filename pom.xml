@@ -93,6 +93,12 @@
                 <artifactId>h2</artifactId>
                 <version>2.5.252</version>
             </dependency>
+            <!-- PostgreSQL JDBC driver for external message tracking and the database partnership/certificate stores -->
+            <dependency>
+                <groupId>org.postgresql</groupId>
+                <artifactId>postgresql</artifactId>
+                <version>42.7.10</version>
+            </dependency>
             <!-- AMQP 1.0 JMS client for the queue-based sender module (Azure Service Bus and any AMQP broker).
                  Qpid JMS 2.x uses the jakarta.jms namespace to match the rest of the jakarta.* stack. -->
             <dependency>
