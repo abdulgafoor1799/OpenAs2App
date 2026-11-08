@@ -90,13 +90,17 @@
                messages.enabled="false"
                messages.polling.interval="120"
              />
-   <!-- EDIPLUG: the AS2 keystore is built in memory from our own key pairs (own_keys.p12, mounted as a secret)
-        and partner public certificates in the as2_partner_certificate table (owned by the EDIPLUG backend).
+   <!-- EDIPLUG: the AS2 keystore is built in memory, with no keystore file, from two tables owned by the EDIPLUG
+        backend: as2_own_key (key pairs of the AS2 IDs this server hosts, private keys encrypted) and
+        as2_partner_certificate (public certificates of trading partners). Everything is validated against the
+        partner tables before the keystore is used; at startup a validation error stops the server.
         Read-only: certificate import/delete commands are rejected. -->
    <certificates classname="org.openas2.cert.DbCertificateFactory"
                  identifier="as2_certs"
-                 own_keys_file="$properties.as2_own_keys_file$"
                  password="$properties.as2_keystore_password$"
+                 private_key_password="$properties.as2_key_encryption_password$"
+                 fail_on_expired="$properties.as2_certs.fail_on_expired$"
+                 expiry_warning_days="$properties.as2_certs.expiry_warning_days$"
                  db_user="$properties.as2_db.user$"
                  db_pwd="$properties.as2_db.password$"
                  jdbc_connect_string="$properties.as2_db.url$"

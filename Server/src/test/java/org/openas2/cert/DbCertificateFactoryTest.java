@@ -4,28 +4,29 @@ import jakarta.mail.internet.MimeBodyPart;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
+import org.bouncycastle.openssl.PKCS8Generator;
 import org.bouncycastle.openssl.jcajce.JcaPEMWriter;
+import org.bouncycastle.openssl.jcajce.JcaPKCS8Generator;
+import org.bouncycastle.openssl.jcajce.JceOpenSSLPKCS8EncryptorBuilder;
+import org.bouncycastle.operator.OutputEncryptor;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
 import org.openas2.OpenAS2Exception;
 import org.openas2.lib.helper.BCCryptoHelper;
 import org.openas2.lib.helper.ICryptoHelper;
 import org.openas2.util.AS2Util;
 
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.StringWriter;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
-import java.security.PrivateKey;
-import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -37,34 +38,35 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Tests the read-only DbCertificateFactory: own keys from a PKCS12 file, partner certificates from the
- * database, change detection, fail-safe reloads and that the resulting keystore works for AS2 signing,
- * encryption, decryption and signature verification in both directions.
+ * Tests the database certificate factory: own key pairs (encrypted PKCS#8) from as2_own_key and partner
+ * certificates from as2_partner_certificate, validated against the partner tables, assembled into an in-memory
+ * keystore that works for AS2 signing/encryption in both directions, and refused (startup fails, reloads keep
+ * the current keystore) when anything is inconsistent.
  */
 public class DbCertificateFactoryTest {
 
-    private static final String PASSWORD = "testpw";
+    private static final String STORE_PASSWORD = "store-pw";
+    private static final String KEY_PASSWORD = "key-encryption-pw";
     private static final String VERSION_QUERY = "SELECT VER FROM config_version WHERE AREA = 'certificates'";
 
     private static KeyPair ownKeys;
     private static X509Certificate ownCert;
-    private static KeyPair partnerKeys;
-    private static X509Certificate partnerCert;
-    private static X509Certificate otherPartnerCert;
+    private static KeyPair retailerKeys;
+    private static X509Certificate retailerCert;
+    private static KeyPair otherKeys;
+    private static X509Certificate otherCert;
+    private static X509Certificate expiredCert;
     private static int dbCounter = 0;
 
-    @TempDir
-    File tempDir;
-
+    private String connectString;
     private Connection seedConn;
     private DbCertificateFactory factory;
-    private File ownKeysFile;
 
     @BeforeAll
     public static void createKeys() throws Exception {
@@ -72,36 +74,59 @@ public class DbCertificateFactoryTest {
         KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
         kpg.initialize(2048);
         ownKeys = kpg.generateKeyPair();
-        ownCert = selfSignedCert(ownKeys, "CN=own");
-        partnerKeys = kpg.generateKeyPair();
-        partnerCert = selfSignedCert(partnerKeys, "CN=partner");
-        otherPartnerCert = selfSignedCert(kpg.generateKeyPair(), "CN=other");
+        ownCert = cert(ownKeys, "CN=own", -1, 365);
+        retailerKeys = kpg.generateKeyPair();
+        retailerCert = cert(retailerKeys, "CN=retailer", -1, 365);
+        otherKeys = kpg.generateKeyPair();
+        otherCert = cert(otherKeys, "CN=other", -1, 365);
+        expiredCert = cert(otherKeys, "CN=expired", -10, -1);
     }
 
     @BeforeEach
     public void setUp() throws Exception {
-        ownKeysFile = new File(tempDir, "own_keys.p12");
-        KeyStore ks = AS2Util.getCryptoHelper().getKeyStore();
-        ks.load(null, PASSWORD.toCharArray());
-        ks.setKeyEntry("own", ownKeys.getPrivate(), PASSWORD.toCharArray(), new Certificate[]{ownCert});
-        try (FileOutputStream out = new FileOutputStream(ownKeysFile)) {
-            ks.store(out, PASSWORD.toCharArray());
-        }
-
-        String connectString = "jdbc:h2:mem:db_cert_factory_test_" + (dbCounter++) + ";DB_CLOSE_DELAY=-1";
+        connectString = "jdbc:h2:mem:db_cert_factory_test_" + (dbCounter++) + ";DB_CLOSE_DELAY=-1";
         seedConn = DriverManager.getConnection(connectString, "sa", "");
         try (Statement s = seedConn.createStatement()) {
+            String ddl = new String(Files.readAllBytes(Paths.get("src", "config", "db_ddl.sql")));
+            for (String statement : ddl.split(";")) {
+                if (!statement.trim().isEmpty()) {
+                    s.execute(statement);
+                }
+            }
+            s.execute("CREATE TABLE as2_own_key (ALIAS VARCHAR(255) PRIMARY KEY, PRIVATE_KEY_PEM CLOB NOT NULL, CERT_CHAIN_PEM CLOB NOT NULL, ENABLED BOOLEAN DEFAULT TRUE NOT NULL)");
             s.execute("CREATE TABLE as2_partner_certificate (ALIAS VARCHAR(255) PRIMARY KEY, CERT_PEM CLOB NOT NULL, ENABLED BOOLEAN DEFAULT TRUE NOT NULL)");
             s.execute("CREATE TABLE config_version (AREA VARCHAR(50) PRIMARY KEY, VER BIGINT NOT NULL)");
             s.executeUpdate("INSERT INTO config_version VALUES ('certificates', 1)");
+            // Our hosted identity and one retailer, with a partnership in each direction
+            s.executeUpdate("INSERT INTO partner (ID, NAME) VALUES (1, 'OWN'), (2, 'RETAILER')");
+            s.executeUpdate("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES"
+                    + " (1, 'as2_id', 'OWN_ID'), (1, 'x509_alias', 'own'), (2, 'as2_id', 'RETAILER_ID'), (2, 'x509_alias', 'retailer')");
+            s.executeUpdate("INSERT INTO partnership (ID, NAME, SENDER_PARTNER_ID, RECEIVER_PARTNER_ID) VALUES (1, 'OWN-to-RETAILER', 1, 2), (2, 'RETAILER-to-OWN', 2, 1)");
         }
-        insertCert("partner", pem(partnerCert), true);
-        insertCert("disabled_partner", pem(otherPartnerCert), false);
+        insertOwnKey("own", encryptedPem(ownKeys, KEY_PASSWORD), pem(ownCert));
+        insertPartnerCert("retailer", pem(retailerCert), true);
+    }
 
-        factory = new DbCertificateFactory();
+    @AfterEach
+    public void tearDown() throws Exception {
+        if (factory != null) {
+            factory.destroy();
+            factory = null;
+        }
+        try {
+            seedConn.close();
+        } catch (Exception e) {
+            // the embedded DB handler may already have shut the database down
+        }
+    }
+
+    // ---- helpers ----
+
+    private DbCertificateFactory newFactory() throws Exception {
+        DbCertificateFactory f = new DbCertificateFactory();
         Map<String, String> params = new HashMap<String, String>();
-        params.put(DbCertificateFactory.PARAM_OWN_KEYS_FILE, ownKeysFile.getAbsolutePath());
-        params.put(DbCertificateFactory.PARAM_PASSWORD, PASSWORD);
+        params.put(DbCertificateFactory.PARAM_PASSWORD, STORE_PASSWORD);
+        params.put(DbCertificateFactory.PARAM_PRIVATE_KEY_PASSWORD, KEY_PASSWORD);
         params.put(DbCertificateFactory.PARAM_USE_EMBEDDED_DB, "true");
         params.put("tcp_server_start", "false");
         params.put(DbCertificateFactory.PARAM_DB_USER, "sa");
@@ -109,21 +134,33 @@ public class DbCertificateFactoryTest {
         params.put(DbCertificateFactory.PARAM_JDBC_CONNECT_STRING, connectString);
         params.put(DbCertificateFactory.PARAM_VERSION_QUERY, VERSION_QUERY);
         params.put(DbCertificateFactory.PARAM_FULL_REFRESH_INTERVAL, "0");
-        factory.init(null, params);
+        try {
+            f.init(null, params);
+        } catch (Exception e) {
+            f.destroy();
+            throw e;
+        }
+        factory = f;
+        return f;
     }
 
-    @AfterEach
-    public void tearDown() throws Exception {
-        // Stopping the factory's embedded DB handler shuts the in-memory database down; every test uses its own
-        factory.destroy();
-        try {
-            seedConn.close();
-        } catch (Exception e) {
-            // already closed by the shutdown
+    /** Asserts that starting the factory fails with a validation error mentioning the given text. */
+    private void assertStartupFails(String expectedText) {
+        DbCertificateFactory.CertificateValidationException e =
+                assertThrows(DbCertificateFactory.CertificateValidationException.class, this::newFactory);
+        assertTrue(e.getMessage().contains(expectedText), "expected \"" + expectedText + "\" in: " + e.getMessage());
+    }
+
+    private void insertOwnKey(String alias, String keyPem, String chainPem) throws Exception {
+        try (PreparedStatement ps = seedConn.prepareStatement("INSERT INTO as2_own_key (ALIAS, PRIVATE_KEY_PEM, CERT_CHAIN_PEM) VALUES (?, ?, ?)")) {
+            ps.setString(1, alias);
+            ps.setString(2, keyPem);
+            ps.setString(3, chainPem);
+            ps.executeUpdate();
         }
     }
 
-    private void insertCert(String alias, String pem, boolean enabled) throws Exception {
+    private void insertPartnerCert(String alias, String pem, boolean enabled) throws Exception {
         try (PreparedStatement ps = seedConn.prepareStatement("INSERT INTO as2_partner_certificate (ALIAS, CERT_PEM, ENABLED) VALUES (?, ?, ?)")) {
             ps.setString(1, alias);
             ps.setString(2, pem);
@@ -142,116 +179,197 @@ public class DbCertificateFactoryTest {
         exec("UPDATE config_version SET VER = VER + 1 WHERE AREA = 'certificates'");
     }
 
+    // ---- successful load ----
+
     @Test
-    public void loadsOwnKeysAndEnabledPartnerCertificates() throws Exception {
+    public void buildsKeystoreFromBothTables() throws Exception {
+        newFactory();
         assertEquals(ownKeys.getPrivate(), factory.getPrivateKey("own"));
         assertEquals(ownCert, factory.getCertificate("own"));
-        assertEquals(partnerCert, factory.getCertificate("partner"));
-        assertThrows(CertificateNotFoundException.class, () -> factory.getCertificate("disabled_partner"));
+        assertEquals(retailerCert, factory.getCertificate("retailer"));
+        assertFalse(factory.getKeyStore().isKeyEntry("retailer"));
         assertEquals(2, factory.getCertificates().size());
     }
 
     @Test
     public void keystoreWorksForSendingAndReceiving() throws Exception {
+        newFactory();
         BCCryptoHelper crypto = new BCCryptoHelper();
         String payload = "ISA*00*TEST~";
 
-        // Outbound: we sign with our key and encrypt for the partner; the partner decrypts and verifies
-        MimeBodyPart outbound = part(payload);
-        MimeBodyPart signed = crypto.sign(outbound, factory.getCertificate("own"), factory.getPrivateKey("own"),
+        // Outbound: sign with our key, encrypt for the retailer; the retailer decrypts and verifies
+        MimeBodyPart signed = crypto.sign(part(payload), factory.getCertificate("own"), factory.getPrivateKey("own"),
                 ICryptoHelper.DIGEST_SHA256, "binary", false, false);
-        MimeBodyPart encrypted = crypto.encrypt(signed, factory.getCertificate("partner"), ICryptoHelper.CRYPT_3DES, "binary");
-        MimeBodyPart partnerDecrypted = crypto.decrypt(encrypted, partnerCert, partnerKeys.getPrivate());
-        MimeBodyPart partnerVerified = crypto.verifySignature(partnerDecrypted, ownCert);
-        assertEquals(payload, content(partnerVerified));
+        MimeBodyPart encrypted = crypto.encrypt(signed, factory.getCertificate("retailer"), ICryptoHelper.CRYPT_3DES, "binary");
+        MimeBodyPart retailerDecrypted = crypto.decrypt(encrypted, retailerCert, retailerKeys.getPrivate());
+        assertEquals(payload, content(crypto.verifySignature(retailerDecrypted, ownCert)));
 
-        // Inbound: the partner signs with its key and encrypts for us; we decrypt and verify with the factory
-        MimeBodyPart inbound = part(payload);
-        MimeBodyPart partnerSigned = crypto.sign(inbound, partnerCert, partnerKeys.getPrivate(),
+        // Inbound: the retailer signs and encrypts for us; we decrypt and verify using the factory
+        MimeBodyPart retailerSigned = crypto.sign(part(payload), retailerCert, retailerKeys.getPrivate(),
                 ICryptoHelper.DIGEST_SHA256, "binary", false, false);
-        MimeBodyPart partnerEncrypted = crypto.encrypt(partnerSigned, ownCert, ICryptoHelper.CRYPT_3DES, "binary");
-        MimeBodyPart decrypted = crypto.decrypt(partnerEncrypted, factory.getCertificate("own"), factory.getPrivateKey("own"));
-        MimeBodyPart verified = crypto.verifySignature(decrypted, factory.getCertificate("partner"));
-        assertEquals(payload, content(verified));
+        MimeBodyPart retailerEncrypted = crypto.encrypt(retailerSigned, ownCert, ICryptoHelper.CRYPT_3DES, "binary");
+        MimeBodyPart decrypted = crypto.decrypt(retailerEncrypted, factory.getCertificate("own"), factory.getPrivateKey("own"));
+        assertEquals(payload, content(crypto.verifySignature(decrypted, factory.getCertificate("retailer"))));
     }
+
+    @Test
+    public void disabledRowsAreIgnored() throws Exception {
+        insertPartnerCert("old_expired", pem(expiredCert), false);
+        newFactory();
+        assertThrows(CertificateNotFoundException.class, () -> factory.getCertificate("old_expired"));
+    }
+
+    // ---- startup validation failures ----
+
+    @Test
+    public void startupFailsWhenAPartnerAliasHasNoCertificate() throws Exception {
+        exec("INSERT INTO partner (ID, NAME) VALUES (3, 'SUPPLIER')");
+        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (3, 'x509_alias', 'supplier_key')");
+        assertStartupFails("\"supplier_key\"");
+    }
+
+    @Test
+    public void startupFailsWhenTablesAreEmpty() throws Exception {
+        exec("DELETE FROM as2_own_key");
+        exec("DELETE FROM as2_partner_certificate");
+        assertStartupFails("\"own\"");
+    }
+
+    @Test
+    public void startupFailsWhenAPartnerHasNoAlias() throws Exception {
+        exec("INSERT INTO partner (ID, NAME) VALUES (3, 'NO_ALIAS')");
+        assertStartupFails("partner \"NO_ALIAS\" has no x509_alias");
+    }
+
+    @Test
+    public void startupFailsWhenAPartnershipOverrideAliasIsMissing() throws Exception {
+        exec("INSERT INTO partnership_attribute (PARTNERSHIP_ID, CATEGORY, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (1, 'sender', 'x509_alias', 'own_2027')");
+        assertStartupFails("\"own_2027\"");
+    }
+
+    @Test
+    public void startupFailsWhenNoSideOfAPartnershipHasAPrivateKey() throws Exception {
+        insertPartnerCert("retailer2", pem(otherCert), true);
+        exec("INSERT INTO partner (ID, NAME) VALUES (3, 'RETAILER2')");
+        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (3, 'x509_alias', 'retailer2')");
+        exec("INSERT INTO partnership (ID, NAME, SENDER_PARTNER_ID, RECEIVER_PARTNER_ID) VALUES (3, 'RETAILER-to-RETAILER2', 2, 3)");
+        assertStartupFails("neither the sender");
+    }
+
+    @Test
+    public void startupFailsWhenPrivateKeyDoesNotMatchCertificate() throws Exception {
+        exec("DELETE FROM as2_own_key");
+        insertOwnKey("own", encryptedPem(otherKeys, KEY_PASSWORD), pem(ownCert));
+        assertStartupFails("private key does not match the certificate");
+    }
+
+    @Test
+    public void startupFailsWithWrongKeyEncryptionPassword() throws Exception {
+        exec("DELETE FROM as2_own_key");
+        insertOwnKey("own", encryptedPem(ownKeys, "some-other-password"), pem(ownCert));
+        assertStartupFails("decryption failed");
+    }
+
+    @Test
+    public void startupFailsForUnencryptedPrivateKey() throws Exception {
+        exec("DELETE FROM as2_own_key");
+        StringWriter sw = new StringWriter();
+        try (JcaPEMWriter w = new JcaPEMWriter(sw)) {
+            w.writeObject(new JcaPKCS8Generator(ownKeys.getPrivate(), null));
+        }
+        insertOwnKey("own", sw.toString(), pem(ownCert));
+        assertStartupFails("not encrypted");
+    }
+
+    @Test
+    public void startupFailsForExpiredCertificate() throws Exception {
+        exec("UPDATE as2_partner_certificate SET CERT_PEM = '" + pem(expiredCert) + "' WHERE ALIAS = 'retailer'");
+        assertStartupFails("certificate expired");
+    }
+
+    @Test
+    public void startupFailsWhenAliasIsInBothTables() throws Exception {
+        insertPartnerCert("OWN", pem(otherCert), true); // differs only by case
+        assertStartupFails("clashes with");
+    }
+
+    @Test
+    public void startupFailsWhenPartnerRowContainsAPrivateKey() throws Exception {
+        exec("UPDATE as2_partner_certificate SET CERT_PEM = '" + pem(retailerCert) + encryptedPem(retailerKeys, "x") + "' WHERE ALIAS = 'retailer'");
+        assertStartupFails("contains private key material");
+    }
+
+    @Test
+    public void startupFailsForBrokenCertificateChain() throws Exception {
+        exec("DELETE FROM as2_own_key");
+        insertOwnKey("own", encryptedPem(ownKeys, KEY_PASSWORD), pem(ownCert) + pem(otherCert));
+        assertStartupFails("is not signed by chain certificate");
+    }
+
+    @Test
+    public void startupFailsForUnparsablePartnerCertificate() throws Exception {
+        exec("UPDATE as2_partner_certificate SET CERT_PEM = '-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----' WHERE ALIAS = 'retailer'");
+        assertStartupFails("cannot be parsed");
+    }
+
+    // ---- reloads ----
 
     @Test
     public void reloadsOnlyWhenVersionChanges() throws Exception {
+        newFactory();
         assertFalse(factory.refreshIfChanged());
-        insertCert("new_partner", pem(otherPartnerCert), true);
-        // Not visible until the version changes
+        exec("INSERT INTO partner (ID, NAME) VALUES (3, 'SUPPLIER')");
+        exec("INSERT INTO partner_attribute (PARTNER_ID, ATTRIBUTE_NAME, ATTRIBUTE_VALUE) VALUES (3, 'x509_alias', 'supplier')");
+        exec("INSERT INTO partnership (ID, NAME, SENDER_PARTNER_ID, RECEIVER_PARTNER_ID) VALUES (3, 'SUPPLIER-to-RETAILER', 3, 2)");
+        insertOwnKey("supplier", encryptedPem(otherKeys, KEY_PASSWORD), pem(otherCert));
         assertFalse(factory.refreshIfChanged());
-        assertThrows(CertificateNotFoundException.class, () -> factory.getCertificate("new_partner"));
 
-        bumpVersion();
-        assertTrue(factory.refreshIfChanged());
-        assertEquals(otherPartnerCert, factory.getCertificate("new_partner"));
-        assertFalse(factory.refreshIfChanged());
-    }
-
-    @Test
-    public void reloadPublishesANewKeystoreInstance() throws Exception {
         KeyStore before = factory.getKeyStore();
         bumpVersion();
         assertTrue(factory.refreshIfChanged());
-        KeyStore after = factory.getKeyStore();
-        assertFalse(before == after);
-        // The old instance is left intact for any lookup still using it
-        assertEquals(partnerCert, before.getCertificate("partner"));
+        assertNotSame(before, factory.getKeyStore());
+        assertEquals(otherKeys.getPrivate(), factory.getPrivateKey("supplier"));
+        // The previous instance is left intact for lookups still using it
+        assertFalse(before.containsAlias("supplier"));
     }
 
     @Test
-    public void unparsableUpdateKeepsCurrentCertificateAndSkipsNewAlias() throws Exception {
-        exec("UPDATE as2_partner_certificate SET CERT_PEM = 'not a certificate' WHERE ALIAS = 'partner'");
-        insertCert("broken_new", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----", true);
-        bumpVersion();
-
-        assertTrue(factory.refreshIfChanged());
-        assertEquals(partnerCert, factory.getCertificate("partner"));
-        assertThrows(CertificateNotFoundException.class, () -> factory.getCertificate("broken_new"));
-    }
-
-    @Test
-    public void databaseAliasCannotReplaceOwnKey() throws Exception {
-        insertCert("own", pem(otherPartnerCert), true);
-        bumpVersion();
-
-        assertTrue(factory.refreshIfChanged());
-        assertEquals(ownCert, factory.getCertificate("own"));
-        assertEquals(ownKeys.getPrivate(), factory.getPrivateKey("own"));
-    }
-
-    @Test
-    public void databaseFailureKeepsCurrentKeystore() throws Exception {
+    public void invalidReloadKeepsTheCurrentKeystore() throws Exception {
+        newFactory();
         KeyStore before = factory.getKeyStore();
-        exec("ALTER TABLE as2_partner_certificate RENAME TO as2_partner_certificate_moved");
+        exec("UPDATE as2_partner_certificate SET CERT_PEM = 'garbage' WHERE ALIAS = 'retailer'");
         bumpVersion();
 
+        assertThrows(DbCertificateFactory.CertificateValidationException.class, () -> factory.refreshIfChanged());
+        assertSame(before, factory.getKeyStore());
+        assertEquals(retailerCert, factory.getCertificate("retailer"));
+
+        exec("UPDATE as2_partner_certificate SET CERT_PEM = '" + pem(retailerCert) + "' WHERE ALIAS = 'retailer'");
+        bumpVersion();
+        assertTrue(factory.refreshIfChanged());
+    }
+
+    @Test
+    public void databaseFailureDuringReloadKeepsTheCurrentKeystore() throws Exception {
+        newFactory();
+        KeyStore before = factory.getKeyStore();
+        exec("ALTER TABLE as2_partner_certificate RENAME TO moved_away");
+        bumpVersion();
         assertThrows(Exception.class, () -> factory.refreshIfChanged());
         assertSame(before, factory.getKeyStore());
-        assertEquals(partnerCert, factory.getCertificate("partner"));
-
-        exec("ALTER TABLE as2_partner_certificate_moved RENAME TO as2_partner_certificate");
-        assertTrue(factory.refreshIfChanged());
     }
 
     @Test
-    public void missingOwnKeysFileFailsReloadAndKeepsKeystore() throws Exception {
-        KeyStore before = factory.getKeyStore();
-        assertTrue(ownKeysFile.delete());
-        assertThrows(OpenAS2Exception.class, () -> factory.refreshIfChanged());
-        assertSame(before, factory.getKeyStore());
-        assertNotNull(factory.getPrivateKey("own"));
-    }
-
-    @Test
-    public void keystoreIsReadOnly() {
-        assertThrows(OpenAS2Exception.class, () -> factory.addCertificate("x", partnerCert, true));
-        assertThrows(OpenAS2Exception.class, () -> factory.addPrivateKey("own", ownKeys.getPrivate(), PASSWORD));
-        assertThrows(OpenAS2Exception.class, () -> factory.removeCertificate("partner"));
+    public void keystoreIsReadOnly() throws Exception {
+        newFactory();
+        assertThrows(OpenAS2Exception.class, () -> factory.addCertificate("x", otherCert, true));
+        assertThrows(OpenAS2Exception.class, () -> factory.addPrivateKey("own", ownKeys.getPrivate(), STORE_PASSWORD));
+        assertThrows(OpenAS2Exception.class, () -> factory.removeCertificate("retailer"));
         assertThrows(OpenAS2Exception.class, () -> factory.clearCertificates());
         assertThrows(OpenAS2Exception.class, () -> factory.save());
     }
+
+    // ---- fixtures ----
 
     private static MimeBodyPart part(String payload) throws Exception {
         MimeBodyPart part = new MimeBodyPart();
@@ -272,12 +390,22 @@ public class DbCertificateFactoryTest {
         return sw.toString();
     }
 
-    private static X509Certificate selfSignedCert(KeyPair keyPair, String dn) throws Exception {
+    private static String encryptedPem(KeyPair keyPair, String password) throws Exception {
+        OutputEncryptor encryptor = new JceOpenSSLPKCS8EncryptorBuilder(PKCS8Generator.AES_256_CBC)
+                .setProvider("BC").setPassword(password.toCharArray()).build();
+        StringWriter sw = new StringWriter();
+        try (JcaPEMWriter writer = new JcaPEMWriter(sw)) {
+            writer.writeObject(new JcaPKCS8Generator(keyPair.getPrivate(), encryptor));
+        }
+        return sw.toString();
+    }
+
+    private static X509Certificate cert(KeyPair keyPair, String dn, int fromDays, int toDays) throws Exception {
         X500Name subject = new X500Name(dn);
+        long now = System.currentTimeMillis();
         JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
                 subject, BigInteger.valueOf(System.nanoTime()),
-                new Date(System.currentTimeMillis() - 3600_000L),
-                new Date(System.currentTimeMillis() + 24 * 3600_000L),
+                new Date(now + fromDays * 24L * 3600_000L), new Date(now + toDays * 24L * 3600_000L),
                 subject, keyPair.getPublic());
         return new JcaX509CertificateConverter().getCertificate(
                 builder.build(new JcaContentSignerBuilder("SHA256withRSA").build(keyPair.getPrivate())));

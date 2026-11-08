@@ -1,5 +1,11 @@
 package org.openas2.cert;
 
+import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
+import org.bouncycastle.openssl.PEMParser;
+import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
+import org.bouncycastle.openssl.jcajce.JceOpenSSLPKCS8DecryptorProviderBuilder;
+import org.bouncycastle.operator.InputDecryptorProvider;
+import org.bouncycastle.pkcs.PKCS8EncryptedPrivateKeyInfo;
 import org.openas2.OpenAS2Exception;
 import org.openas2.WrappedException;
 import org.openas2.params.ComponentParameters;
@@ -15,133 +21,259 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
-import java.io.File;
-import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.security.Key;
 import java.security.KeyStore;
+import java.security.MessageDigest;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.SecureRandom;
+import java.security.Signature;
 import java.security.cert.Certificate;
-import java.security.cert.CertificateException;
 import java.security.cert.CertificateExpiredException;
 import java.security.cert.CertificateNotYetValidException;
 import java.security.cert.X509Certificate;
+import java.security.interfaces.RSAKey;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * A read-only certificate factory that assembles the AS2 keystore in memory from two sources:
+ * A read-only certificate factory that builds the AS2 keystore in memory from two database tables:
  * <ul>
- * <li>a PKCS12 file holding our own key pairs ("own_keys_file"), normally mounted as a secret, and</li>
- * <li>partner public certificates stored as PEM in a database table (any JDBC database, using the same
- * connection parameters as the DbTrackingModule and DbPartnershipFactory).</li>
+ * <li>{@code as2_own_key}: key pairs for the AS2 identities hosted by this server (our own IDs, the IDs of the
+ * suppliers we operate, test/health-check IDs). The private key is stored as an <b>encrypted</b> PKCS#8 PEM
+ * ("BEGIN ENCRYPTED PRIVATE KEY"), decrypted with the "private_key_password" parameter, together with the
+ * certificate chain (leaf first).</li>
+ * <li>{@code as2_partner_certificate}: public certificates of remote trading partners (retailers etc.).</li>
  * </ul>
- * No private keys are read from the database.
+ * Nothing is read from or written to the file system.
  * <p>
- * Every reload builds a complete new keystore and only then publishes it, so lookups never see a partially
- * loaded keystore and a failed reload leaves the current keystore in use. A database row whose certificate
- * cannot be parsed is skipped; if the alias is already loaded the currently loaded certificate is kept so a bad
- * update does not take a working partner offline. A database alias that clashes with an own key alias is ignored.
+ * Every load reads the key tables and the partner tables in one database snapshot, validates everything,
+ * builds a complete new keystore, verifies it and only then publishes it (atomic swap of the volatile keystore
+ * reference). Validation errors are collected and reported together. At startup any validation error fails the
+ * component, so OpenAS2 does not start with an incomplete or inconsistent keystore. On a scheduled reload a
+ * validation error keeps the current keystore in use.
  * <p>
+ * Validations (errors unless stated otherwise):
+ * <ul>
+ * <li>own keys: the private key PEM is encrypted (unless "allow_unencrypted_keys" is true), decrypts with the
+ * configured password, the certificate chain parses, the private key matches the leaf certificate (sign/verify
+ * test), each chain certificate is signed by the next one;</li>
+ * <li>partner certificates: the PEM parses as an X.509 certificate and contains no private key;</li>
+ * <li>all certificates: currently valid (expired or not yet valid is an error when "fail_on_expired" is true,
+ * otherwise a warning); expiring within "expiry_warning_days" (default 30) is a warning; RSA keys below 2048 bits
+ * are a warning;</li>
+ * <li>aliases are unique across both tables (case-insensitively, as PKCS12 aliases are case-insensitive);</li>
+ * <li>every partner's x509_alias, and every per-partnership sender/receiver x509_alias override, resolves to an
+ * enabled entry in one of the two tables;</li>
+ * <li>every partnership has a private key for at least one side (otherwise it can neither sign/decrypt nor
+ * receive);</li>
+ * <li>certificates not referenced by any partner are a warning.</li>
+ * </ul>
  * Change detection: when "version_query" is set, each scheduled tick (every "interval" seconds) only runs that
- * query and the keystore is rebuilt when the value changes, when the own keys file changes, or every
- * "full_refresh_interval" seconds (default 3600, 0 disables). Without it every tick rebuilds the keystore.
+ * query and the keystore is rebuilt when the value changes, or every "full_refresh_interval" seconds
+ * (default 3600, 0 disables).
  * <p>
  * Certificates are managed outside OpenAS2, so every method that would change the keystore throws.
- * <p>
- * Example:
- * <pre>
- * &lt;certificates classname="org.openas2.cert.DbCertificateFactory" identifier="as2_certs"
- *     own_keys_file="/opt/openas2/secrets/own_keys.p12" password="$properties.as2_keystore_password$"
- *     db_user="..." db_pwd="..." jdbc_connect_string="jdbc:postgresql://..." jdbc_driver="org.postgresql.Driver"
- *     force_load_jdbc_driver="true"
- *     version_query="SELECT version FROM config_version WHERE area = 'certificates'"
- *     interval="10"/&gt;
- * </pre>
  */
 public class DbCertificateFactory extends X509CertificateFactory implements HasSchedule {
 
-    public static final String PARAM_OWN_KEYS_FILE = "own_keys_file";
-    public static final String PARAM_OWN_KEYS_PASSWORD = "own_keys_password";
+    public static final String PARAM_PRIVATE_KEY_PASSWORD = "private_key_password";
     public static final String PARAM_DB_USER = "db_user";
     public static final String PARAM_DB_PWD = "db_pwd";
     public static final String PARAM_JDBC_CONNECT_STRING = "jdbc_connect_string";
     public static final String PARAM_JDBC_DRIVER = "jdbc_driver";
     public static final String PARAM_FORCE_LOAD_JDBC_DRIVER = "force_load_jdbc_driver";
     public static final String PARAM_USE_EMBEDDED_DB = "use_embedded_db";
-    public static final String PARAM_CERT_QUERY = "cert_query";
+    public static final String PARAM_OWN_KEY_QUERY = "own_key_query";
+    public static final String PARAM_PARTNER_CERT_QUERY = "partner_cert_query";
+    public static final String PARAM_PARTNER_ALIAS_QUERY = "partner_alias_query";
+    public static final String PARAM_PARTNERSHIP_ALIAS_QUERY = "partnership_alias_query";
+    public static final String PARAM_VALIDATE_PARTNER_ALIASES = "validate_partner_aliases";
+    public static final String PARAM_FAIL_ON_EXPIRED = "fail_on_expired";
+    public static final String PARAM_EXPIRY_WARNING_DAYS = "expiry_warning_days";
+    public static final String PARAM_ALLOW_UNENCRYPTED_KEYS = "allow_unencrypted_keys";
     public static final String PARAM_VERSION_QUERY = "version_query";
     public static final String PARAM_FULL_REFRESH_INTERVAL = "full_refresh_interval";
+
     public static final int DEFAULT_FULL_REFRESH_INTERVAL = 3600;
-    public static final String DEFAULT_CERT_QUERY =
+    public static final int DEFAULT_EXPIRY_WARNING_DAYS = 30;
+
+    public static final String DEFAULT_OWN_KEY_QUERY =
+            "SELECT ALIAS, PRIVATE_KEY_PEM, CERT_CHAIN_PEM FROM as2_own_key WHERE ENABLED = TRUE ORDER BY ALIAS";
+    public static final String DEFAULT_PARTNER_CERT_QUERY =
             "SELECT ALIAS, CERT_PEM FROM as2_partner_certificate WHERE ENABLED = TRUE ORDER BY ALIAS";
+    /** Partner name and its x509_alias attribute (null when the partner has none). */
+    public static final String DEFAULT_PARTNER_ALIAS_QUERY =
+            "SELECT p.NAME, a.ATTRIBUTE_VALUE FROM partner p"
+            + " LEFT JOIN partner_attribute a ON a.PARTNER_ID = p.ID AND a.ATTRIBUTE_NAME = 'x509_alias'"
+            + " ORDER BY p.NAME";
+    /** Partnership name with the effective sender and receiver x509_alias (partnership override, else partner). */
+    public static final String DEFAULT_PARTNERSHIP_ALIAS_QUERY =
+            "SELECT ps.NAME, COALESCE(so.ATTRIBUTE_VALUE, sa.ATTRIBUTE_VALUE), COALESCE(ro.ATTRIBUTE_VALUE, ra.ATTRIBUTE_VALUE)"
+            + " FROM partnership ps"
+            + " LEFT JOIN partner_attribute sa ON sa.PARTNER_ID = ps.SENDER_PARTNER_ID AND sa.ATTRIBUTE_NAME = 'x509_alias'"
+            + " LEFT JOIN partner_attribute ra ON ra.PARTNER_ID = ps.RECEIVER_PARTNER_ID AND ra.ATTRIBUTE_NAME = 'x509_alias'"
+            + " LEFT JOIN partnership_attribute so ON so.PARTNERSHIP_ID = ps.ID AND so.CATEGORY = 'sender' AND so.ATTRIBUTE_NAME = 'x509_alias'"
+            + " LEFT JOIN partnership_attribute ro ON ro.PARTNERSHIP_ID = ps.ID AND ro.CATEGORY = 'receiver' AND ro.ATTRIBUTE_NAME = 'x509_alias'"
+            + " ORDER BY ps.NAME";
 
     private static final String READ_ONLY_MSG =
-            "Certificates are managed outside OpenAS2 (database and own keys file); the keystore is read-only";
+            "Certificates are managed in the database (as2_own_key / as2_partner_certificate); the keystore is read-only";
 
     private final Logger logger = LoggerFactory.getLogger(DbCertificateFactory.class);
 
     private IDBHandler dbHandler = null;
     private volatile String loadedVersion = null;
     private volatile long lastFullLoadMillis = 0;
-    private volatile long ownKeysLastModified = -1;
     private int consecutiveFailures = 0;
 
-    @Override
-    public String getFilename() throws InvalidParameterException {
-        return getParameter(PARAM_OWN_KEYS_FILE, true);
+    /** Thrown when the data read from the database does not produce a valid keystore. */
+    public static class CertificateValidationException extends OpenAS2Exception {
+        private static final long serialVersionUID = 1L;
+        private final List<String> problems;
+
+        public CertificateValidationException(List<String> problems) {
+            super("AS2 keystore validation failed with " + problems.size() + " error(s):\n  - " + String.join("\n  - ", problems));
+            this.problems = problems;
+        }
+
+        public List<String> getProblems() {
+            return problems;
+        }
     }
 
+    // ---- Data read from the database in one snapshot ----
+
+    private static final class Snapshot {
+        String version;
+        final Map<String, String[]> ownKeys = new LinkedHashMap<String, String[]>();   // alias -> {key pem, chain pem}
+        final Map<String, String> partnerCerts = new LinkedHashMap<String, String>();  // alias -> cert pem
+        final Map<String, String> partnerAliases = new LinkedHashMap<String, String>(); // partner -> x509_alias
+        final List<String[]> partnershipAliases = new ArrayList<String[]>();           // {name, sender alias, receiver alias}
+    }
+
+    /** Messages collected while validating; errors fail the load, warnings are only logged. */
+    private static final class Findings {
+        final List<String> errors = new ArrayList<String>();
+        final List<String> warnings = new ArrayList<String>();
+    }
+
+    @Override
+    public String getFilename() {
+        // There is no keystore file; used only in log and error messages by inherited code
+        return "database";
+    }
+
+    // ---- Loading ----
+
     /**
-     * Builds a new keystore from the own keys file and the database and publishes it. On any failure the
-     * current keystore stays in use.
+     * Reads both certificate tables and the partner tables, validates them, builds a new keystore and publishes
+     * it. On failure the current keystore (if any) stays in use and the exception lists every problem found.
      */
     @Override
     public synchronized void load() throws OpenAS2Exception {
         ensureDbHandler();
+        Snapshot snapshot = readSnapshot();
+        Findings findings = new Findings();
+        KeyStore newKs = buildKeyStore(snapshot, findings);
+        if (findings.errors.isEmpty()) {
+            verifyKeyStore(newKs, snapshot, findings);
+        }
+        for (String warning : findings.warnings) {
+            logger.warn("Keystore " + getIdentifier() + ": " + warning);
+        }
+        if (!findings.errors.isEmpty()) {
+            for (String error : findings.errors) {
+                logger.error("Keystore " + getIdentifier() + ": " + error);
+            }
+            throw new CertificateValidationException(findings.errors);
+        }
+        // Publish the complete, verified keystore in one step (the field is volatile)
+        setKeyStore(newKs);
+        loadedVersion = snapshot.version;
+        lastFullLoadMillis = System.currentTimeMillis();
+        logger.info("Loaded " + snapshot.ownKeys.size() + " own key pairs and " + snapshot.partnerCerts.size()
+                + " partner certificates" + (snapshot.version != null ? " (version " + snapshot.version + ")" : "")
+                + " into keystore " + getIdentifier() + " after validating " + snapshot.partnerAliases.size()
+                + " partners and " + snapshot.partnershipAliases.size() + " partnerships");
+    }
+
+    private Snapshot readSnapshot() throws OpenAS2Exception {
+        Snapshot snapshot = new Snapshot();
         String versionQuery = getVersionQuery();
-        try {
-            char[] password = getPassword();
-            File ownKeysFile = new File(getFilename());
-            long ownKeysModified = ownKeysFile.lastModified();
-
-            KeyStore newKs = AS2Util.getCryptoHelper().getKeyStore();
-            newKs.load(null, password);
-            int ownKeys = copyOwnKeys(ownKeysFile, newKs, password);
-
-            String version;
-            int partnerCerts;
-            try (Connection conn = dbHandler.getConnection()) {
-                boolean autoCommit = conn.getAutoCommit();
+        boolean validateAliases = isValidatePartnerAliases();
+        try (Connection conn = dbHandler.getConnection()) {
+            boolean autoCommit = conn.getAutoCommit();
+            int isolation = conn.getTransactionIsolation();
+            try {
+                // One snapshot so keys, certificates, partners and the version are consistent with each other
+                conn.setAutoCommit(false);
                 try {
-                    conn.setAutoCommit(false);
-                    version = versionQuery == null ? null : readVersion(conn, versionQuery);
-                    partnerCerts = addPartnerCertificates(conn, newKs);
-                    conn.commit();
-                } finally {
-                    try {
-                        conn.setAutoCommit(autoCommit);
-                    } catch (Exception e) {
-                        logger.debug("Failed to restore auto commit: " + e.getMessage());
+                    conn.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+                } catch (SQLException e) {
+                    logger.debug("Repeatable read isolation not supported, using the default: " + e.getMessage());
+                }
+                if (versionQuery != null) {
+                    snapshot.version = readVersion(conn, versionQuery);
+                }
+                try (PreparedStatement s = conn.prepareStatement(getParameter(PARAM_OWN_KEY_QUERY, DEFAULT_OWN_KEY_QUERY));
+                     ResultSet rs = s.executeQuery()) {
+                    while (rs.next()) {
+                        putUnique(snapshot.ownKeys, rs.getString(1), new String[]{rs.getString(2), rs.getString(3)}, "as2_own_key");
                     }
                 }
+                try (PreparedStatement s = conn.prepareStatement(getParameter(PARAM_PARTNER_CERT_QUERY, DEFAULT_PARTNER_CERT_QUERY));
+                     ResultSet rs = s.executeQuery()) {
+                    while (rs.next()) {
+                        putUnique(snapshot.partnerCerts, rs.getString(1), rs.getString(2), "as2_partner_certificate");
+                    }
+                }
+                if (validateAliases) {
+                    try (PreparedStatement s = conn.prepareStatement(getParameter(PARAM_PARTNER_ALIAS_QUERY, DEFAULT_PARTNER_ALIAS_QUERY));
+                         ResultSet rs = s.executeQuery()) {
+                        while (rs.next()) {
+                            snapshot.partnerAliases.put(rs.getString(1), rs.getString(2));
+                        }
+                    }
+                    try (PreparedStatement s = conn.prepareStatement(getParameter(PARAM_PARTNERSHIP_ALIAS_QUERY, DEFAULT_PARTNERSHIP_ALIAS_QUERY));
+                         ResultSet rs = s.executeQuery()) {
+                        while (rs.next()) {
+                            snapshot.partnershipAliases.add(new String[]{rs.getString(1), rs.getString(2), rs.getString(3)});
+                        }
+                    }
+                }
+                conn.commit();
+                return snapshot;
+            } catch (Exception e) {
+                try {
+                    conn.rollback();
+                } catch (SQLException re) {
+                    logger.debug("Rollback after failed certificate read failed: " + re.getMessage());
+                }
+                throw e;
+            } finally {
+                try {
+                    conn.setAutoCommit(autoCommit);
+                    conn.setTransactionIsolation(isolation);
+                } catch (SQLException e) {
+                    logger.debug("Failed to restore connection settings: " + e.getMessage());
+                }
             }
-
-            // Publish the complete keystore in one step (the field is volatile)
-            setKeyStore(newKs);
-            loadedVersion = version;
-            ownKeysLastModified = ownKeysModified;
-            lastFullLoadMillis = System.currentTimeMillis();
-            logger.info("Loaded " + ownKeys + " own key entries and " + partnerCerts + " partner certificates"
-                    + (version != null ? " (version " + version + ")" : "") + " into keystore " + getIdentifier());
         } catch (OpenAS2Exception e) {
             throw e;
         } catch (Exception e) {
@@ -149,115 +281,329 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
         }
     }
 
-    private int copyOwnKeys(File ownKeysFile, KeyStore target, char[] password) throws Exception {
-        if (!ownKeysFile.isFile()) {
-            throw new OpenAS2Exception("Own keys file not found: " + ownKeysFile.getAbsolutePath());
+    private static <V> void putUnique(Map<String, V> map, String alias, V value, String table) throws OpenAS2Exception {
+        if (map.put(alias, value) != null) {
+            throw new OpenAS2Exception("Alias \"" + alias + "\" is returned more than once from " + table);
         }
-        String ownKeysPwd = getParameter(PARAM_OWN_KEYS_PASSWORD, false);
-        char[] sourcePassword = ownKeysPwd == null ? password : ownKeysPwd.toCharArray();
-        KeyStore source;
-        try (InputStream in = new FileInputStream(ownKeysFile)) {
-            source = AS2Util.getCryptoHelper().loadKeyStore(in, sourcePassword);
-        }
-        int count = 0;
-        Enumeration<String> aliases = source.aliases();
-        while (aliases.hasMoreElements()) {
-            String alias = aliases.nextElement();
-            if (source.isKeyEntry(alias)) {
-                Key key = source.getKey(alias, sourcePassword);
-                Certificate[] chain = source.getCertificateChain(alias);
-                if (key == null || chain == null || chain.length == 0) {
-                    throw new OpenAS2Exception("Own keys file entry has no usable key or certificate chain: " + alias);
-                }
-                // Stored with the factory password because that is what getPrivateKey() reads it back with
-                target.setKeyEntry(alias, key, password, chain);
-                warnIfNotCurrentlyValid(alias, chain[0]);
-            } else {
-                target.setCertificateEntry(alias, source.getCertificate(alias));
-            }
-            count++;
-        }
-        return count;
     }
 
-    private int addPartnerCertificates(Connection conn, KeyStore target) throws Exception {
-        KeyStore current = getKeyStore();
-        String certQuery = getParameter(PARAM_CERT_QUERY, DEFAULT_CERT_QUERY);
-        java.security.cert.CertificateFactory cf = java.security.cert.CertificateFactory.getInstance("X.509");
-        Map<String, String> rows = new LinkedHashMap<String, String>();
-        try (PreparedStatement s = conn.prepareStatement(certQuery);
-             ResultSet rs = s.executeQuery()) {
-            while (rs.next()) {
-                rows.put(rs.getString(1), rs.getString(2));
-            }
+    // ---- Building and validating ----
+
+    private KeyStore buildKeyStore(Snapshot snapshot, Findings findings) throws OpenAS2Exception {
+        char[] password = getPassword();
+        KeyStore ks;
+        try {
+            ks = AS2Util.getCryptoHelper().getKeyStore();
+            ks.load(null, password);
+        } catch (Exception e) {
+            throw new WrappedException(e);
         }
-        int count = 0;
-        for (Map.Entry<String, String> row : rows.entrySet()) {
+        boolean failOnExpired = !"false".equalsIgnoreCase(getParameter(PARAM_FAIL_ON_EXPIRED, "true"));
+        int warningDays = getParameterInt(PARAM_EXPIRY_WARNING_DAYS, false, DEFAULT_EXPIRY_WARNING_DAYS);
+        boolean allowUnencrypted = "true".equalsIgnoreCase(getParameter(PARAM_ALLOW_UNENCRYPTED_KEYS, "false"));
+        char[] keyPassword = getPrivateKeyPassword();
+
+        // Aliases must be unique across both tables; PKCS12 keystore aliases are case-insensitive
+        Map<String, String> aliasOwner = new HashMap<String, String>();
+        Map<String, String> fingerprints = new HashMap<String, String>();
+
+        for (Map.Entry<String, String[]> row : snapshot.ownKeys.entrySet()) {
             String alias = row.getKey();
-            if (alias == null || alias.trim().isEmpty()) {
-                logger.error("Ignoring a partner certificate row with an empty alias");
+            String where = "own key \"" + alias + "\"";
+            if (!checkAlias(alias, "as2_own_key", aliasOwner, findings)) {
                 continue;
             }
-            if (target.isKeyEntry(alias)) {
-                logger.error("Ignoring partner certificate for alias \"" + alias + "\": the alias belongs to an own key entry");
+            PrivateKey key;
+            X509Certificate[] chain;
+            try {
+                key = decryptPrivateKey(row.getValue()[0], keyPassword, allowUnencrypted);
+            } catch (Exception e) {
+                findings.errors.add(where + ": private key cannot be read: " + e.getMessage());
+                continue;
+            }
+            try {
+                chain = parseCertificates(row.getValue()[1]);
+            } catch (Exception e) {
+                findings.errors.add(where + ": certificate chain cannot be parsed: " + e.getMessage());
+                continue;
+            }
+            if (!keyMatchesCertificate(key, chain[0])) {
+                findings.errors.add(where + ": private key does not match the certificate (" + chain[0].getSubjectX500Principal() + ")");
+                continue;
+            }
+            for (int i = 0; i + 1 < chain.length; i++) {
+                try {
+                    chain[i].verify(chain[i + 1].getPublicKey());
+                } catch (Exception e) {
+                    findings.errors.add(where + ": chain certificate " + (i + 1) + " is not signed by chain certificate " + (i + 2));
+                }
+            }
+            checkValidity(where, chain[0], failOnExpired, warningDays, findings);
+            checkKeySize(where, chain[0].getPublicKey(), findings);
+            recordFingerprint(where, chain[0], fingerprints, findings);
+            try {
+                ks.setKeyEntry(alias, key, password, chain);
+            } catch (Exception e) {
+                findings.errors.add(where + ": cannot be added to the keystore: " + e.getMessage());
+            }
+        }
+
+        for (Map.Entry<String, String> row : snapshot.partnerCerts.entrySet()) {
+            String alias = row.getKey();
+            String where = "partner certificate \"" + alias + "\"";
+            if (!checkAlias(alias, "as2_partner_certificate", aliasOwner, findings)) {
+                continue;
+            }
+            String pem = row.getValue();
+            if (pem != null && pem.contains("PRIVATE KEY")) {
+                findings.errors.add(where + ": contains private key material; partner rows must hold the public certificate only");
                 continue;
             }
             X509Certificate cert;
             try {
-                cert = parseCertificate(cf, row.getValue());
+                cert = parseCertificates(pem)[0];
             } catch (Exception e) {
-                X509Certificate previous = currentCertificate(current, alias);
-                if (previous != null) {
-                    logger.error("Partner certificate for alias \"" + alias + "\" could not be parsed, keeping the currently loaded certificate: " + e.getMessage());
-                    target.setCertificateEntry(alias, previous);
-                    count++;
-                } else {
-                    logger.error("Partner certificate for alias \"" + alias + "\" could not be parsed and is skipped: " + e.getMessage());
-                }
+                findings.errors.add(where + ": certificate cannot be parsed: " + e.getMessage());
                 continue;
             }
-            warnIfNotCurrentlyValid(alias, cert);
-            target.setCertificateEntry(alias, cert);
-            count++;
+            checkValidity(where, cert, failOnExpired, warningDays, findings);
+            checkKeySize(where, cert.getPublicKey(), findings);
+            recordFingerprint(where, cert, fingerprints, findings);
+            try {
+                ks.setCertificateEntry(alias, cert);
+            } catch (Exception e) {
+                findings.errors.add(where + ": cannot be added to the keystore: " + e.getMessage());
+            }
         }
-        return count;
+
+        if (isValidatePartnerAliases()) {
+            validatePartnerAliases(snapshot, aliasOwner, findings);
+        }
+        return ks;
     }
 
-    private X509Certificate parseCertificate(java.security.cert.CertificateFactory cf, String pem) throws CertificateException, OpenAS2Exception {
+    private boolean checkAlias(String alias, String table, Map<String, String> aliasOwner, Findings findings) {
+        if (alias == null || alias.trim().isEmpty()) {
+            findings.errors.add(table + " has a row with an empty alias");
+            return false;
+        }
+        String previous = aliasOwner.put(alias.toLowerCase(Locale.ROOT), table + ":" + alias);
+        if (previous != null) {
+            findings.errors.add("alias \"" + alias + "\" (" + table + ") clashes with " + previous
+                    + "; aliases must be unique across as2_own_key and as2_partner_certificate (case-insensitive)");
+            return false;
+        }
+        return true;
+    }
+
+    private void validatePartnerAliases(Snapshot snapshot, Map<String, String> aliasOwner, Findings findings) {
+        java.util.Set<String> referenced = new java.util.HashSet<String>();
+        for (Map.Entry<String, String> partner : snapshot.partnerAliases.entrySet()) {
+            String alias = partner.getValue();
+            if (alias == null || alias.trim().isEmpty()) {
+                findings.errors.add("partner \"" + partner.getKey() + "\" has no x509_alias attribute");
+                continue;
+            }
+            referenced.add(alias.toLowerCase(Locale.ROOT));
+            if (!aliasOwner.containsKey(alias.toLowerCase(Locale.ROOT))) {
+                findings.errors.add("partner \"" + partner.getKey() + "\" uses x509_alias \"" + alias
+                        + "\" but there is no enabled row for it in as2_own_key or as2_partner_certificate");
+            }
+        }
+        for (String[] ps : snapshot.partnershipAliases) {
+            String name = ps[0];
+            boolean senderOwn = isOwnKey(ps[1], aliasOwner);
+            boolean receiverOwn = isOwnKey(ps[2], aliasOwner);
+            for (int i = 1; i <= 2; i++) {
+                String alias = ps[i];
+                String side = i == 1 ? "sender" : "receiver";
+                if (alias == null || alias.trim().isEmpty()) {
+                    findings.errors.add("partnership \"" + name + "\": " + side + " has no x509_alias");
+                    continue;
+                }
+                referenced.add(alias.toLowerCase(Locale.ROOT));
+                if (!aliasOwner.containsKey(alias.toLowerCase(Locale.ROOT))) {
+                    findings.errors.add("partnership \"" + name + "\": " + side + " x509_alias \"" + alias
+                            + "\" has no enabled row in as2_own_key or as2_partner_certificate");
+                }
+            }
+            if (ps[1] != null && ps[2] != null && aliasOwner.containsKey(ps[1].toLowerCase(Locale.ROOT))
+                    && aliasOwner.containsKey(ps[2].toLowerCase(Locale.ROOT)) && !senderOwn && !receiverOwn) {
+                findings.errors.add("partnership \"" + name + "\": neither the sender (\"" + ps[1] + "\") nor the receiver (\""
+                        + ps[2] + "\") has a private key in as2_own_key, so this server can neither send nor receive it");
+            }
+        }
+        for (String owner : aliasOwner.values()) {
+            String alias = owner.substring(owner.indexOf(':') + 1);
+            if (!referenced.contains(alias.toLowerCase(Locale.ROOT))) {
+                findings.warnings.add(owner + " is not referenced by any partner or partnership");
+            }
+        }
+    }
+
+    private static boolean isOwnKey(String alias, Map<String, String> aliasOwner) {
+        if (alias == null) {
+            return false;
+        }
+        String owner = aliasOwner.get(alias.toLowerCase(Locale.ROOT));
+        return owner != null && owner.startsWith("as2_own_key:");
+    }
+
+    /** Re-reads every entry from the built keystore and checks it behaves as the AS2 code will use it. */
+    private void verifyKeyStore(KeyStore ks, Snapshot snapshot, Findings findings) throws OpenAS2Exception {
+        char[] password = getPassword();
+        try {
+            for (String alias : snapshot.ownKeys.keySet()) {
+                Key key = ks.getKey(alias, password);
+                Certificate[] chain = ks.getCertificateChain(alias);
+                if (!(key instanceof PrivateKey) || chain == null || chain.length == 0 || !(chain[0] instanceof X509Certificate)) {
+                    findings.errors.add("own key \"" + alias + "\": keystore entry is incomplete after loading");
+                } else if (!keyMatchesCertificate((PrivateKey) key, (X509Certificate) chain[0])) {
+                    findings.errors.add("own key \"" + alias + "\": keystore entry failed the sign/verify check");
+                }
+            }
+            for (String alias : snapshot.partnerCerts.keySet()) {
+                if (ks.isKeyEntry(alias) || !(ks.getCertificate(alias) instanceof X509Certificate)) {
+                    findings.errors.add("partner certificate \"" + alias + "\": keystore entry is missing or not a certificate entry");
+                }
+            }
+            int expected = snapshot.ownKeys.size() + snapshot.partnerCerts.size();
+            if (ks.size() != expected) {
+                findings.errors.add("keystore holds " + ks.size() + " entries, expected " + expected);
+            }
+        } catch (Exception e) {
+            findings.errors.add("keystore verification failed: " + e.getMessage());
+        }
+    }
+
+    // ---- Crypto helpers ----
+
+    private PrivateKey decryptPrivateKey(String pem, char[] keyPassword, boolean allowUnencrypted) throws Exception {
+        if (pem == null || pem.trim().isEmpty()) {
+            throw new OpenAS2Exception("empty private key");
+        }
+        Object parsed;
+        try (PEMParser parser = new PEMParser(new StringReader(pem))) {
+            parsed = parser.readObject();
+        }
+        JcaPEMKeyConverter converter = new JcaPEMKeyConverter().setProvider("BC");
+        if (parsed instanceof PKCS8EncryptedPrivateKeyInfo) {
+            if (keyPassword == null) {
+                throw new OpenAS2Exception("the key is encrypted but no private_key_password is configured");
+            }
+            InputDecryptorProvider decryptor = new JceOpenSSLPKCS8DecryptorProviderBuilder().setProvider("BC").build(keyPassword);
+            try {
+                return converter.getPrivateKey(((PKCS8EncryptedPrivateKeyInfo) parsed).decryptPrivateKeyInfo(decryptor));
+            } catch (Exception e) {
+                throw new OpenAS2Exception("decryption failed (wrong private_key_password or corrupt key)");
+            }
+        }
+        if (parsed instanceof PrivateKeyInfo) {
+            if (!allowUnencrypted) {
+                throw new OpenAS2Exception("the private key is not encrypted; store it as an encrypted PKCS#8 PEM (BEGIN ENCRYPTED PRIVATE KEY)");
+            }
+            return converter.getPrivateKey((PrivateKeyInfo) parsed);
+        }
+        throw new OpenAS2Exception("expected an encrypted PKCS#8 PEM (BEGIN ENCRYPTED PRIVATE KEY), found "
+                + (parsed == null ? "nothing" : parsed.getClass().getSimpleName()));
+    }
+
+    private static X509Certificate[] parseCertificates(String pem) throws Exception {
         if (pem == null || pem.trim().isEmpty()) {
             throw new OpenAS2Exception("empty certificate");
         }
-        Collection<? extends Certificate> certs = cf.generateCertificates(new ByteArrayInputStream(pem.trim().getBytes(StandardCharsets.US_ASCII)));
-        if (certs.isEmpty() || !(certs.iterator().next() instanceof X509Certificate)) {
+        java.security.cert.CertificateFactory cf = java.security.cert.CertificateFactory.getInstance("X.509");
+        Collection<? extends Certificate> certs;
+        try (InputStream in = new ByteArrayInputStream(pem.trim().getBytes(StandardCharsets.US_ASCII))) {
+            certs = cf.generateCertificates(in);
+        }
+        if (certs.isEmpty()) {
             throw new OpenAS2Exception("no X.509 certificate found");
         }
-        // The first certificate is the partner certificate; any following ones are its issuers
-        return (X509Certificate) certs.iterator().next();
+        List<X509Certificate> list = new ArrayList<X509Certificate>();
+        for (Certificate c : certs) {
+            if (!(c instanceof X509Certificate)) {
+                throw new OpenAS2Exception("not an X.509 certificate");
+            }
+            list.add((X509Certificate) c);
+        }
+        return list.toArray(new X509Certificate[0]);
     }
 
-    private X509Certificate currentCertificate(KeyStore current, String alias) {
-        if (current == null) {
-            return null;
+    /** True if data signed with the private key verifies with the certificate's public key. */
+    static boolean keyMatchesCertificate(PrivateKey key, X509Certificate cert) {
+        String algorithm;
+        String keyAlg = key.getAlgorithm();
+        if ("RSA".equalsIgnoreCase(keyAlg)) {
+            algorithm = "SHA256withRSA";
+        } else if ("EC".equalsIgnoreCase(keyAlg) || "ECDSA".equalsIgnoreCase(keyAlg)) {
+            algorithm = "SHA256withECDSA";
+        } else if ("DSA".equalsIgnoreCase(keyAlg)) {
+            algorithm = "SHA256withDSA";
+        } else {
+            return false;
         }
         try {
-            Certificate cert = current.getCertificate(alias);
-            return cert instanceof X509Certificate ? (X509Certificate) cert : null;
+            byte[] data = new byte[32];
+            new SecureRandom().nextBytes(data);
+            Signature signer = Signature.getInstance(algorithm);
+            signer.initSign(key);
+            signer.update(data);
+            byte[] sig = signer.sign();
+            Signature verifier = Signature.getInstance(algorithm);
+            verifier.initVerify(cert.getPublicKey());
+            verifier.update(data);
+            return verifier.verify(sig);
         } catch (Exception e) {
-            return null;
+            return false;
         }
     }
 
-    private void warnIfNotCurrentlyValid(String alias, Certificate cert) {
-        if (!(cert instanceof X509Certificate)) {
-            return;
-        }
+    private static void checkValidity(String where, X509Certificate cert, boolean failOnExpired, int warningDays, Findings findings) {
         try {
-            ((X509Certificate) cert).checkValidity();
+            cert.checkValidity();
+            long daysLeft = (cert.getNotAfter().getTime() - System.currentTimeMillis()) / (24L * 3600 * 1000);
+            if (warningDays > 0 && daysLeft < warningDays) {
+                findings.warnings.add(where + ": certificate expires in " + daysLeft + " day(s) on " + cert.getNotAfter());
+            }
         } catch (CertificateExpiredException e) {
-            logger.warn("Certificate for alias \"" + alias + "\" has expired: " + ((X509Certificate) cert).getNotAfter());
+            (failOnExpired ? findings.errors : findings.warnings).add(where + ": certificate expired on " + cert.getNotAfter());
         } catch (CertificateNotYetValidException e) {
-            logger.warn("Certificate for alias \"" + alias + "\" is not valid until " + ((X509Certificate) cert).getNotBefore());
+            (failOnExpired ? findings.errors : findings.warnings).add(where + ": certificate is not valid before " + cert.getNotBefore());
         }
+    }
+
+    private static void checkKeySize(String where, PublicKey publicKey, Findings findings) {
+        if (publicKey instanceof RSAKey && ((RSAKey) publicKey).getModulus().bitLength() < 2048) {
+            findings.warnings.add(where + ": RSA key is only " + ((RSAKey) publicKey).getModulus().bitLength() + " bits");
+        }
+    }
+
+    private static void recordFingerprint(String where, X509Certificate cert, Map<String, String> fingerprints, Findings findings) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(cert.getEncoded());
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) {
+                sb.append(String.format("%02x", b));
+            }
+            String previous = fingerprints.put(sb.toString(), where);
+            if (previous != null) {
+                findings.warnings.add(where + " has the same certificate as " + previous);
+            }
+        } catch (Exception e) {
+            findings.warnings.add(where + ": cannot compute fingerprint: " + e.getMessage());
+        }
+    }
+
+    // ---- Parameters and database ----
+
+    private char[] getPrivateKeyPassword() throws InvalidParameterException {
+        String pwd = getParameter(PARAM_PRIVATE_KEY_PASSWORD, false);
+        return (pwd == null || pwd.isEmpty()) ? null : pwd.toCharArray();
+    }
+
+    private boolean isValidatePartnerAliases() throws InvalidParameterException {
+        return !"false".equalsIgnoreCase(getParameter(PARAM_VALIDATE_PARTNER_ALIASES, "true"));
     }
 
     private synchronized void ensureDbHandler() throws OpenAS2Exception {
@@ -296,8 +642,10 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
         }
     }
 
+    // ---- Scheduled refresh ----
+
     /**
-     * Rebuilds the keystore if the database version or the own keys file changed, or a full reload is due.
+     * Rebuilds the keystore if the database version changed or a full reload is due.
      *
      * @return true if the keystore was rebuilt
      * @throws OpenAS2Exception if the check or the reload failed; the current keystore stays in use
@@ -311,8 +659,7 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
         int fullRefreshInterval = getParameterInt(PARAM_FULL_REFRESH_INTERVAL, false, DEFAULT_FULL_REFRESH_INTERVAL);
         boolean fullRefreshDue = fullRefreshInterval > 0
                 && System.currentTimeMillis() - lastFullLoadMillis >= fullRefreshInterval * 1000L;
-        boolean ownKeysChanged = new File(getFilename()).lastModified() != ownKeysLastModified;
-        if (!fullRefreshDue && !ownKeysChanged) {
+        if (!fullRefreshDue) {
             ensureDbHandler();
             String version;
             try (Connection conn = dbHandler.getConnection()) {
@@ -326,8 +673,6 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
                 return false;
             }
             logger.info("Certificate version changed from " + loadedVersion + " to " + version + ", reloading keystore");
-        } else if (ownKeysChanged) {
-            logger.info("Own keys file changed, reloading keystore");
         }
         load();
         return true;
@@ -351,7 +696,7 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
                 } catch (Exception e) {
                     consecutiveFailures++;
                     if (consecutiveFailures == 1) {
-                        logger.error("Failed to refresh certificates, keeping the current keystore: " + e.getMessage(), e);
+                        logger.error("Failed to refresh certificates, keeping the current keystore: " + e.getMessage());
                     } else {
                         logger.warn("Certificate refresh still failing (attempt " + consecutiveFailures + "): " + e.getMessage());
                     }
@@ -425,4 +770,5 @@ public class DbCertificateFactory extends X509CertificateFactory implements HasS
     public void load(InputStream in, char[] password) throws OpenAS2Exception {
         throw new OpenAS2Exception(READ_ONLY_MSG);
     }
+
 }
