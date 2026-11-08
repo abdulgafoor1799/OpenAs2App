@@ -1,0 +1,82 @@
+# EDIPLUG AS2 node: nginx (behind the cloud load balancer) -> OpenAS2, plus autoheal.
+# PostgreSQL is external (AWS RDS). Configuration is baked into the OpenAS2 image; everything that differs per
+# environment comes from .env (copy .env.example). Run with: docker compose up -d
+name: ediplug-as2
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ediplug-nginx
+    restart: always
+    ports:
+      - "80:8080"               # load balancer target port; allow it from the load balancer only
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      openas2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/nginx-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [app]
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    labels:
+      autoheal: "true"
+
+  openas2:
+    image: ${OPENAS2_IMAGE:?set OPENAS2_IMAGE in .env}   # e.g. <account>.dkr.ecr.<region>.amazonaws.com/ediplug-openas2:4.15.0-ediplug-s5
+    container_name: EDIPLUG_AS2_SERVER
+    restart: always
+    init: true
+    environment:
+      AS2_DB_HOST: ${AS2_DB_HOST:?}
+      AS2_DB_PORT: ${AS2_DB_PORT:-5432}
+      AS2_DB_NAME: ${AS2_DB_NAME:-openas2}
+      AS2_DB_USER: ${AS2_DB_USER:-openas2}
+      AS2_DB_PASSWORD: ${AS2_DB_PASSWORD:?}
+      AS2_DB_SSLMODE: ${AS2_DB_SSLMODE:-verify-full}
+      AS2_DB_SSLROOTCERT: ${AS2_DB_SSLROOTCERT:-/opt/openas2/config/rds-global-bundle.pem}
+      AS2_KEY_ENCRYPTION_PASSWORD: ${AS2_KEY_ENCRYPTION_PASSWORD:?}
+      AS2_KEYSTORE_PASSWORD: ${AS2_KEYSTORE_PASSWORD:?}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      OPENAS2_LOG_LEVEL: ${OPENAS2_LOG_LEVEL:-INFO}
+    volumes:
+      # inbox / outbox / MDNs / pending state; must be writable by UID 1000 (chown -R 1000:0 ./data)
+      - ./data:/opt/openas2/data:rw
+    expose: ["10080", "10081", "10099"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:10099/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    stop_grace_period: 40s       # OpenAS2 waits up to 25s for in-flight sends on shutdown
+    networks: [app]
+    logging: *logging
+    labels:
+      autoheal: "true"
+
+  autoheal:
+    image: willfarrell/autoheal:1.2.0
+    container_name: ediplug-autoheal
+    restart: always
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 15
+      AUTOHEAL_START_PERIOD: 120
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging: *logging
+
+networks:
+  app:
+    driver: bridge

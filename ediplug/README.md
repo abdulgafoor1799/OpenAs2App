@@ -25,6 +25,12 @@ Code changes on top of upstream:
   on a reload it keeps the current keystore.
 - `X509CertificateFactory.keyStore` is `volatile`.
 
+## Further documentation
+
+- `ediplug/docs/keystore-and-reloads.md`: how keys, certificates, trusted CAs and partnerships are loaded and hot-swapped
+- `ediplug/docs/fresh-vm-setup.md`: bringing up a node on a fresh VM behind a load balancer (AWS RDS + ECR)
+- `ediplug/deploy/`: docker-compose.yml (nginx + OpenAS2 + autoheal), nginx.conf for a load balancer, .env.example
+
 ## Build
 
 ```sh

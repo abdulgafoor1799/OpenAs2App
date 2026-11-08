@@ -1,0 +1,2 @@
+# Real environment files hold secrets and must never be committed
+.env
