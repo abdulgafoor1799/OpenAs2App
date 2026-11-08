@@ -24,6 +24,8 @@ import java.io.IOException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -41,6 +43,16 @@ import java.util.concurrent.TimeUnit;
  * the partner/partnership console and REST API commands. The in-memory state is loaded
  * at startup, after every change made through this factory, on the "refresh" console
  * command and (if the "interval" parameter is set) on a fixed schedule.
+ * <p>
+ * Change detection (optional): when the "version_query" parameter is set, each scheduled tick
+ * only runs that query (it must return a single value, typically a counter bumped by a database
+ * trigger whenever the partnership tables change) and the partnerships are reloaded only when
+ * the value differs from the one read with the currently loaded state. A full reload is still
+ * done every "full_refresh_interval" seconds (default 3600, 0 disables) as a safety net.
+ * <p>
+ * Reloads are fail-safe: the database is read completely before anything is changed, so a
+ * database error during a refresh leaves the current partnerships and their directory pollers
+ * running. If the new poller configuration cannot be applied the previous one is restored.
  * <p>
  * Table structure (see Server/src/resources/db/openas2-schema.xml and db_ddl.sql):
  * <ul>
@@ -61,6 +73,9 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
     public static final String PARAM_FORCE_LOAD_JDBC_DRIVER = "force_load_jdbc_driver";
     public static final String PARAM_USE_EMBEDDED_DB = "use_embedded_db";
     public static final String PARAM_INTERVAL = "interval";
+    public static final String PARAM_VERSION_QUERY = "version_query";
+    public static final String PARAM_FULL_REFRESH_INTERVAL = "full_refresh_interval";
+    public static final int DEFAULT_FULL_REFRESH_INTERVAL = 3600;
 
     public static final String CATEGORY_ATTRIBUTE = "attribute";
     public static final String CATEGORY_SENDER = Partnership.PTYPE_SENDER;
@@ -74,6 +89,33 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
     // Set once init() completes so refreshes triggered at runtime restart the partnership
     // pollers (at startup Session.start() does that after the whole system is wired up)
     private boolean initialized = false;
+
+    // The state currently applied, kept so a failed apply can restore the previous pollers
+    private LoadedState currentState = null;
+    // Version value read in the same transaction as the currently applied state (null if not tracked)
+    private volatile String loadedVersion = null;
+    private volatile long lastFullLoadMillis = 0;
+    // Consecutive scheduled refresh failures, used to avoid an ERROR (and alert email) on every tick
+    private int consecutiveFailures = 0;
+
+    /**
+     * Everything read from the database for one refresh. Building it has no side effects on the
+     * session, so a failure while reading leaves the running configuration untouched.
+     */
+    private static final class LoadedState {
+        final Map<String, Object> partners;
+        final List<Partnership> partnerships;
+        final List<Map.Entry<Partnership, Map<String, String>>> pollerConfigs;
+        final String version;
+
+        LoadedState(Map<String, Object> partners, List<Partnership> partnerships,
+                    List<Map.Entry<Partnership, Map<String, String>>> pollerConfigs, String version) {
+            this.partners = partners;
+            this.partnerships = partnerships;
+            this.pollerConfigs = pollerConfigs;
+            this.version = version;
+        }
+    }
 
     private Logger logger = LoggerFactory.getLogger(DbPartnershipFactory.class);
 
@@ -113,39 +155,164 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
         initialized = true;
     }
 
-    public void refresh() throws OpenAS2Exception {
-        Session session = getSession();
-        if (session != null) {
-            session.destroyPartnershipPollers(Session.PARTNERSHIP_POLLER);
+    /**
+     * Reloads the partners and partnerships from the database. The database is read completely
+     * first; the directory pollers are only rebuilt once the new state has been read successfully.
+     *
+     * @throws OpenAS2Exception if the database cannot be read or the new state cannot be applied;
+     *                          the previously loaded state stays active in both cases
+     */
+    public synchronized void refresh() throws OpenAS2Exception {
+        LoadedState state = readState();
+        applyState(state);
+        if (logger.isInfoEnabled()) {
+            logger.info("Loaded " + state.partners.size() + " partners and " + state.partnerships.size()
+                    + " partnerships from database" + (state.version != null ? " (version " + state.version + ")" : ""));
         }
-        try (Connection conn = dbHandler.getConnection()) {
-            Map<Long, Map<String, String>> partnersById = loadPartners(conn);
-            Map<String, Object> newPartners = new HashMap<String, Object>();
-            for (Map<String, String> partner : partnersById.values()) {
-                String name = partner.get(Partnership.PID_NAME);
-                if (newPartners.put(name, partner) != null) {
-                    throw new OpenAS2Exception("Partner is defined more than once: " + name);
-                }
-            }
-            List<Partnership> newPartnerships = loadPartnerships(conn, partnersById);
+    }
 
-            synchronized (this) {
-                this.partners = newPartners;
-                setPartnerships(newPartnerships);
-            }
-            if (logger.isInfoEnabled()) {
-                logger.info("Loaded " + newPartners.size() + " partners and " + newPartnerships.size() + " partnerships from database");
+    private LoadedState readState() throws OpenAS2Exception {
+        String versionQuery = getVersionQuery();
+        try (Connection conn = dbHandler.getConnection()) {
+            boolean autoCommit = conn.getAutoCommit();
+            int isolation = conn.getTransactionIsolation();
+            try {
+                // Read the version and all tables in one snapshot so the version matches the data
+                conn.setAutoCommit(false);
+                try {
+                    conn.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+                } catch (SQLException e) {
+                    logger.debug("Repeatable read isolation not supported, using the default: " + e.getMessage());
+                }
+                String version = versionQuery == null ? null : readVersion(conn, versionQuery);
+                Map<Long, Map<String, String>> partnersById = loadPartners(conn);
+                Map<String, Object> newPartners = new HashMap<String, Object>();
+                for (Map<String, String> partner : partnersById.values()) {
+                    String name = partner.get(Partnership.PID_NAME);
+                    if (newPartners.put(name, partner) != null) {
+                        throw new OpenAS2Exception("Partner is defined more than once: " + name);
+                    }
+                }
+                List<Map.Entry<Partnership, Map<String, String>>> pollerConfigs = new ArrayList<Map.Entry<Partnership, Map<String, String>>>();
+                List<Partnership> newPartnerships = loadPartnerships(conn, partnersById, pollerConfigs);
+                conn.commit();
+                return new LoadedState(newPartners, newPartnerships, pollerConfigs, version);
+            } catch (Exception e) {
+                try {
+                    conn.rollback();
+                } catch (SQLException re) {
+                    logger.debug("Rollback after failed partnership read failed: " + re.getMessage());
+                }
+                throw e;
+            } finally {
+                try {
+                    conn.setAutoCommit(autoCommit);
+                    conn.setTransactionIsolation(isolation);
+                } catch (SQLException e) {
+                    logger.debug("Failed to restore connection settings: " + e.getMessage());
+                }
             }
         } catch (OpenAS2Exception e) {
             throw e;
         } catch (Exception e) {
             throw new WrappedException(e);
         }
+    }
+
+    private void applyState(LoadedState state) throws OpenAS2Exception {
+        Session session = getSession();
+        if (session != null) {
+            session.destroyPartnershipPollers(Session.PARTNERSHIP_POLLER);
+        }
+        try {
+            launchPartnershipPollers(state);
+        } catch (OpenAS2Exception e) {
+            logger.error("Failed to apply the partnership poller configuration read from the database, restoring the previous configuration: " + e.getMessage(), e);
+            if (session != null) {
+                session.destroyPartnershipPollers(Session.PARTNERSHIP_POLLER);
+            }
+            if (currentState != null) {
+                try {
+                    launchPartnershipPollers(currentState);
+                } catch (OpenAS2Exception re) {
+                    logger.error("Failed to restore the previous partnership pollers: " + re.getMessage(), re);
+                }
+            }
+            if (initialized && session != null) {
+                session.startPartnershipPollers();
+            }
+            throw e;
+        }
+        synchronized (this) {
+            this.partners = state.partners;
+            setPartnerships(state.partnerships);
+            this.currentState = state;
+            this.loadedVersion = state.version;
+            this.lastFullLoadMillis = System.currentTimeMillis();
+        }
         // At startup Session.start() starts the pollers once everything is wired up; for
         // runtime refreshes the destroy/reload above leaves them stopped so restart them here
         if (initialized && session != null) {
             session.startPartnershipPollers();
         }
+    }
+
+    private void launchPartnershipPollers(LoadedState state) throws OpenAS2Exception {
+        for (Map.Entry<Partnership, Map<String, String>> entry : state.pollerConfigs) {
+            launchPartnershipPoller(entry.getKey(), entry.getValue());
+        }
+    }
+
+    private String getVersionQuery() throws InvalidParameterException {
+        String query = getParameter(PARAM_VERSION_QUERY, false);
+        return (query == null || query.trim().isEmpty()) ? null : query;
+    }
+
+    private String readVersion(Connection conn, String versionQuery) throws Exception {
+        try (PreparedStatement s = conn.prepareStatement(versionQuery);
+             ResultSet rs = s.executeQuery()) {
+            if (!rs.next()) {
+                throw new OpenAS2Exception("The partnership version_query returned no rows: " + versionQuery);
+            }
+            return rs.getString(1);
+        }
+    }
+
+    private String readVersion(String versionQuery) throws OpenAS2Exception {
+        try (Connection conn = dbHandler.getConnection()) {
+            return readVersion(conn, versionQuery);
+        } catch (OpenAS2Exception e) {
+            throw e;
+        } catch (Exception e) {
+            throw new WrappedException(e);
+        }
+    }
+
+    /**
+     * Scheduled check: without a version query this is a plain refresh. With one, only the version
+     * is read and the partnerships are reloaded when it changed or a full refresh is due.
+     *
+     * @return true if the partnerships were reloaded
+     * @throws OpenAS2Exception if the version or the partnerships could not be read
+     */
+    public boolean refreshIfChanged() throws OpenAS2Exception {
+        String versionQuery = getVersionQuery();
+        if (versionQuery == null) {
+            refresh();
+            return true;
+        }
+        int fullRefreshInterval = getParameterInt(PARAM_FULL_REFRESH_INTERVAL, false, DEFAULT_FULL_REFRESH_INTERVAL);
+        boolean fullRefreshDue = fullRefreshInterval > 0
+                && System.currentTimeMillis() - lastFullLoadMillis >= fullRefreshInterval * 1000L;
+        if (!fullRefreshDue) {
+            String version = readVersion(versionQuery);
+            if (version != null && version.equals(loadedVersion)) {
+                return false;
+            }
+            logger.info("Partnership version changed from " + loadedVersion + " to " + version + ", reloading partnerships");
+        }
+        refresh();
+        return true;
     }
 
     // Keyed by partner ID so partnerships can resolve their sender/receiver rows
@@ -172,7 +339,8 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
         return partnersById;
     }
 
-    private List<Partnership> loadPartnerships(Connection conn, Map<Long, Map<String, String>> partnersById) throws Exception {
+    private List<Partnership> loadPartnerships(Connection conn, Map<Long, Map<String, String>> partnersById,
+                                               List<Map.Entry<Partnership, Map<String, String>>> pollerConfigs) throws Exception {
         List<Partnership> newPartnerships = new ArrayList<Partnership>();
         Map<Long, Partnership> partnershipsById = new HashMap<Long, Partnership>();
         try (PreparedStatement s = conn.prepareStatement("SELECT ID, NAME, SENDER_PARTNER_ID, RECEIVER_PARTNER_ID FROM partnership");
@@ -253,9 +421,10 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
                 }
             }
         }
+        // Pollers are only collected here and launched once the whole state has been read
         for (Map.Entry<Long, Map<String, String>> entry : pollerConfigsById.entrySet()) {
             Partnership partnership = partnershipsById.get(entry.getKey());
-            launchPartnershipPoller(partnership, entry.getValue());
+            pollerConfigs.add(new AbstractMap.SimpleImmutableEntry<Partnership, Map<String, String>>(partnership, entry.getValue()));
             // Surface the poller config in the view/list command output the same way the
             // view command renders the pollerConfig element of the XML partnerships file
             entry.getValue().forEach((key, value) -> partnership.getAttributes().put("pollerConfig." + key, value));
@@ -665,9 +834,20 @@ public class DbPartnershipFactory extends BasePartnershipFactory implements Refr
             @Override
             public void run() {
                 try {
-                    refresh();
+                    refreshIfChanged();
+                    if (consecutiveFailures > 0) {
+                        logger.info("Partnership refresh from database recovered after " + consecutiveFailures + " failed attempt(s)");
+                        consecutiveFailures = 0;
+                    }
                 } catch (Exception e) {
-                    logger.error("Failed to refresh partnerships from database: " + e.getMessage(), e);
+                    consecutiveFailures++;
+                    // Only the first failure is an ERROR (which may trigger alerting); repeats while the
+                    // database stays unavailable are logged as warnings. The loaded state stays active.
+                    if (consecutiveFailures == 1) {
+                        logger.error("Failed to refresh partnerships from database, keeping the current partnerships: " + e.getMessage(), e);
+                    } else {
+                        logger.warn("Partnership refresh from database still failing (attempt " + consecutiveFailures + "): " + e.getMessage());
+                    }
                 }
             }
         }, interval, interval, TimeUnit.SECONDS);
