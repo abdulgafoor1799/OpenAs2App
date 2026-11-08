@@ -55,7 +55,8 @@ public class X509CertificateFactory extends BaseCertificateFactory implements Al
     public static final String PARAM_FILENAME = "filename";
     public static final String PARAM_PASSWORD = "password";
     public static final String PARAM_INTERVAL = "interval";
-    private KeyStore keyStore;
+    // volatile so a factory that rebuilds the keystore can publish the new instance to all threads in one step
+    private volatile KeyStore keyStore;
 
     private Logger logger = LoggerFactory.getLogger(X509CertificateFactory.class);
 
