@@ -54,18 +54,21 @@ Files: `ediplug/deploy/` in the `ediplug/db-config` branch of the OpenAs2App for
 
 ## 2. Database (once per environment)
 
-As the RDS master user, from any host that can reach RDS (the VM itself, or a bastion):
+As the RDS master user, from any host that can reach RDS (the VM itself, or a bastion), run the single init
+script. It creates the database, both roles, every table, the triggers and the grants, and is idempotent:
 
 ```sh
-export PGHOST=<rds-endpoint> PGUSER=<master> PGSSLMODE=verify-full PGSSLROOTCERT=global-bundle.pem
 curl -fsSo global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
-psql -d postgres -c "CREATE DATABASE openas2"
-for f in V1__partnership_tables V2__config_version V3__partner_certificates V4__own_keys V5__ssl_trusted_ca; do
-  psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/$f.sql
-done
-psql -d openas2 -c "\password openas2"            # runtime role used by OpenAS2 (SELECT on config tables)
-psql -d openas2 -c "\password as2_config_admin"   # writer role for the EDIPLUG backend
+psql "host=<rds-endpoint> user=<master> dbname=postgres sslmode=verify-full sslrootcert=global-bundle.pem" \
+     -v ON_ERROR_STOP=1 -v openas2_password='<runtime role password>' -v admin_password='<writer role password>' \
+     -f ediplug/db/openas2_rds_init.sql
 ```
+
+- `openas2` (runtime, used by the container): SELECT on config/certificate tables, SELECT/INSERT/UPDATE on
+  `msg_metadata`, owns nothing.
+- `as2_config_admin` (writer: migrations, EDIPLUG backend): owns every table.
+- `ediplug/db/V1`..`V5` are the incremental upgrade path for the old (pre-RDS) database only; a fresh database
+  uses `openas2_rds_init.sql`.
 
 Load data, either by **copying from the current server**:
 
@@ -76,7 +79,7 @@ docker exec ediplug-postgres pg_dump -U postgres -Fc --data-only \
   -t as2_own_key -t as2_partner_certificate -t as2_ssl_trusted_ca -t msg_metadata \
   openas2 > openas2-data.dump
 # into RDS, triggers enabled (version counters and alias checks run; config_version is seeded by V2)
-pg_restore -d openas2 --data-only --single-transaction openas2-data.dump
+pg_restore -U as2_config_admin -d openas2 --data-only --single-transaction openas2-data.dump
 ```
 
 or **from scratch** with the tools in the image (see `ediplug/README.md`):

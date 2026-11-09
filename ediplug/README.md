@@ -52,7 +52,12 @@ docker build -f ediplug/Dockerfile --build-arg SKIP_TESTS=true -t openas2:4.15.0
 
 Mounts: `/opt/openas2/data` only (inbox/outbox/MDN, writable by UID 1000). No config or key files are mounted.
 
-## Database setup (new database, e.g. RDS)
+## Database setup
+
+**New database (e.g. AWS RDS):** run `ediplug/db/openas2_rds_init.sql` once as the master user (see
+`ediplug/docs/fresh-vm-setup.md`). It creates everything below, with all tables owned by `as2_config_admin`.
+
+**Upgrading the old self-hosted database:** apply the incremental scripts below
 
 Run as the master/superuser, in order (all scripts are idempotent):
 
