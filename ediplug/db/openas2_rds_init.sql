@@ -17,6 +17,11 @@
 --   psql "...dbname=postgres sslmode=verify-full sslrootcert=global-bundle.pem" -v ON_ERROR_STOP=1 \
 --        -v openas2_password='...' -v admin_password='...' -f openas2_rds_init.sql
 --
+-- Optional variables (defaults shown), e.g. for a dev database on the same instance:
+--   -v db_name=openas2  -v runtime_role=openas2  -v admin_role=as2_config_admin
+--   psql ... -v db_name=openas2-dev -v runtime_role=openas2_dev -v admin_role=as2_config_admin_dev ...
+-- The OpenAS2 container then uses AS2_DB_NAME=<db_name>, AS2_DB_USER=<runtime_role>; the backend uses <admin_role>.
+--
 -- Idempotent: safe to run again (existing objects are kept; passwords are only set on first creation).
 -- Pass both -v password variables on every run, also re-runs: psql cannot parse the script without them.
 -- =====================================================================================================================
@@ -26,30 +31,43 @@
 -- PART 1: cluster level (connected to database "postgres")
 -- ---------------------------------------------------------------------------------------------------------------------
 
--- Roles. Passwords come from the psql variables, so they are not stored in this file.
-SELECT format('CREATE ROLE openas2 LOGIN PASSWORD %L', :'openas2_password')
-WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'openas2') \gexec
+\if :{?db_name}
+\else
+\set db_name openas2
+\endif
+\if :{?runtime_role}
+\else
+\set runtime_role openas2
+\endif
+\if :{?admin_role}
+\else
+\set admin_role as2_config_admin
+\endif
 
-SELECT format('CREATE ROLE as2_config_admin LOGIN PASSWORD %L', :'admin_password')
-WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'as2_config_admin') \gexec
+-- Roles. Passwords come from the psql variables, so they are not stored in this file.
+SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'runtime_role', :'openas2_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'runtime_role') \gexec
+
+SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'admin_role', :'admin_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'admin_role') \gexec
 
 -- The RDS master user is not a superuser. It must be a member of a role to make that role the owner of objects
 -- (ALTER ... OWNER TO) in part 2.
-GRANT openas2, as2_config_admin TO CURRENT_USER;
+GRANT :"runtime_role", :"admin_role" TO CURRENT_USER;
 
 -- Database (CREATE DATABASE cannot run inside a transaction or DO block, hence \gexec)
-SELECT 'CREATE DATABASE openas2 ENCODING ''UTF8'''
-WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'openas2') \gexec
+SELECT format('CREATE DATABASE %I ENCODING ''UTF8''', :'db_name')
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db_name') \gexec
 
 -- Only our two roles (and the master user) may connect to this database
-REVOKE ALL    ON DATABASE openas2 FROM PUBLIC;
-GRANT CONNECT ON DATABASE openas2 TO openas2, as2_config_admin;
+REVOKE ALL    ON DATABASE :"db_name" FROM PUBLIC;
+GRANT CONNECT ON DATABASE :"db_name" TO :"runtime_role", :"admin_role";
 
 
 -- ---------------------------------------------------------------------------------------------------------------------
 -- PART 2: inside database openas2
 -- ---------------------------------------------------------------------------------------------------------------------
-\connect openas2
+\connect :"db_name"
 
 BEGIN;
 
@@ -57,8 +75,8 @@ BEGIN;
 -- Only as2_config_admin may create objects. A non-superuser can make a role the owner of a table only if that role
 -- has CREATE here, so every table is owned by as2_config_admin.
 REVOKE ALL   ON SCHEMA public FROM PUBLIC;
-GRANT USAGE  ON SCHEMA public TO openas2, as2_config_admin;
-GRANT CREATE ON SCHEMA public TO as2_config_admin;
+GRANT USAGE  ON SCHEMA public TO :"runtime_role", :"admin_role";
+GRANT CREATE ON SCHEMA public TO :"admin_role";
 
 
 -- =====================================================================================================================
@@ -310,28 +328,28 @@ CREATE TRIGGER as2_partner_certificate_alias_unique
 -- =====================================================================================================================
 
 -- Every table belongs to the writer role (the msg_metadata id sequence follows its table)
-ALTER TABLE msg_metadata            OWNER TO as2_config_admin;
-ALTER TABLE partner                 OWNER TO as2_config_admin;
-ALTER TABLE partner_attribute       OWNER TO as2_config_admin;
-ALTER TABLE partnership             OWNER TO as2_config_admin;
-ALTER TABLE partnership_attribute   OWNER TO as2_config_admin;
-ALTER TABLE config_version          OWNER TO as2_config_admin;
-ALTER TABLE as2_partner_certificate OWNER TO as2_config_admin;
-ALTER TABLE as2_own_key             OWNER TO as2_config_admin;
-ALTER TABLE as2_ssl_trusted_ca      OWNER TO as2_config_admin;
-ALTER FUNCTION bump_config_version()    OWNER TO as2_config_admin;
-ALTER FUNCTION check_as2_alias_unique() OWNER TO as2_config_admin;
+ALTER TABLE msg_metadata            OWNER TO :"admin_role";
+ALTER TABLE partner                 OWNER TO :"admin_role";
+ALTER TABLE partner_attribute       OWNER TO :"admin_role";
+ALTER TABLE partnership             OWNER TO :"admin_role";
+ALTER TABLE partnership_attribute   OWNER TO :"admin_role";
+ALTER TABLE config_version          OWNER TO :"admin_role";
+ALTER TABLE as2_partner_certificate OWNER TO :"admin_role";
+ALTER TABLE as2_own_key             OWNER TO :"admin_role";
+ALTER TABLE as2_ssl_trusted_ca      OWNER TO :"admin_role";
+ALTER FUNCTION bump_config_version()    OWNER TO :"admin_role";
+ALTER FUNCTION check_as2_alias_unique() OWNER TO :"admin_role";
 
 -- OpenAS2 only reads the configuration and certificate tables
 REVOKE ALL   ON partner, partner_attribute, partnership, partnership_attribute, config_version,
                 as2_partner_certificate, as2_own_key, as2_ssl_trusted_ca FROM PUBLIC;
 GRANT SELECT ON partner, partner_attribute, partnership, partnership_attribute, config_version,
-                as2_partner_certificate, as2_own_key, as2_ssl_trusted_ca TO openas2;
+                as2_partner_certificate, as2_own_key, as2_ssl_trusted_ca TO :"runtime_role";
 
 -- Message tracking: exactly what OpenAS2's DbTrackingModule does (SELECT, INSERT, UPDATE; no DELETE, no DDL)
 REVOKE ALL ON msg_metadata FROM PUBLIC;
-GRANT SELECT, INSERT, UPDATE ON msg_metadata        TO openas2;
-GRANT USAGE                  ON SEQUENCE msg_metadata_id_seq TO openas2;   -- nextval() for the serial id
+GRANT SELECT, INSERT, UPDATE ON msg_metadata        TO :"runtime_role";
+GRANT USAGE                  ON SEQUENCE msg_metadata_id_seq TO :"runtime_role";   -- nextval() for the serial id
 
 COMMIT;
 
