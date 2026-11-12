@@ -54,22 +54,26 @@ Mounts: `/opt/openas2/data` only (inbox/outbox/MDN, writable by UID 1000). No co
 
 ## Database setup
 
-**New database (e.g. AWS RDS):** run `ediplug/db/openas2_rds_init.sql` once as the master user (see
-`ediplug/docs/fresh-vm-setup.md`). It creates everything below, with all tables owned by `as2_config_admin`.
-
-**Upgrading the old self-hosted database:** apply the incremental scripts below
-
-Run as the master/superuser, in order (all scripts are idempotent):
+One script, `ediplug/db/create_env_databases.sql`, run once per environment (dev, staging, prod ...) as a login with
+CREATEDB + CREATEROLE (RDS master user), connected to `postgres`:
 
 ```sh
-psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/V1__partnership_tables.sql
-psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/V2__config_version.sql
-psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/V3__partner_certificates.sql
-psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/V4__own_keys.sql
-psql -v ON_ERROR_STOP=1 -d openas2 -f ediplug/db/V5__ssl_trusted_ca.sql
-psql -d openas2 -c '\password openas2'            # runtime role
-psql -d openas2 -c '\password as2_config_admin'   # backend / migrations role
+psql "host=<rds> port=5432 user=<admin> dbname=postgres sslmode=verify-full sslrootcert=ap-south-1-bundle.pem" \
+     -f ediplug/db/create_env_databases.sql
 ```
+
+It asks for the environment name, the names (Enter = default) and the passwords of new roles, and creates:
+
+| Object | Default | |
+|---|---|---|
+| database | `ediplug-<env>` | empty, owned by `ediplug_app_<env>` (the orchestrator creates its own tables) |
+| database | `openas2-<env>` | every table OpenAS2 needs, owned by `as2_config_admin_<env>` |
+| role | `openas2_<env>` | OpenAS2 container: SELECT on config/cert tables, SELECT/INSERT/UPDATE on `msg_metadata` |
+| role | `as2_config_admin_<env>` | single writer of the AS2 configuration |
+| role | `ediplug_app_<env>` | orchestrator application database owner |
+
+Non-interactive: `EDIPLUG_ENV=dev EDIPLUG_APP_PASSWORD=... OPENAS2_RUNTIME_PASSWORD=... OPENAS2_ADMIN_PASSWORD=... psql ... -f ...`
+(or `-v env=dev -v as2_db=...`). It is idempotent: existing databases, roles and tables are kept.
 
 ## Migrating existing files
 

@@ -1,38 +1,38 @@
 -- =====================================================================================================================
--- EDIPLUG database bootstrap (AWS RDS PostgreSQL 16+; tested on 18.3)
+-- EDIPLUG: create the databases of one environment (dev, staging, prod ...) on AWS RDS PostgreSQL 16+ (tested on 18.3)
 --
--- Creates, for one environment (dev, staging, prod ...):
---   <app_db>   e.g. ediplug-dev    EdiPlug orchestrator database, owned by <app_role>; all application tables
---                                  (users, sessions, clients, partners, documents ...) + alembic_version = '0001'
---   <as2_db>   e.g. openas2-dev    OpenAS2 configuration + message tracking database; every table OpenAS2 4.15 needs
---   roles      <app_role>          orchestrator login, owns <app_db>
---              <admin_role>        owns all <as2_db> tables; single writer of the AS2 configuration (orchestrator)
---              <runtime_role>      OpenAS2 container login: SELECT on config/cert tables, SELECT/INSERT/UPDATE on
---                                  msg_metadata, owns nothing
+-- Creates:
+--   <app_db>   default ediplug-<env>   empty database owned by <app_role> (its tables are not created here)
+--   <as2_db>   default openas2-<env>   every table OpenAS2 4.15 needs: partner, partner_attribute, partnership,
+--                                      partnership_attribute, config_version (+ triggers), as2_own_key,
+--                                      as2_partner_certificate, as2_ssl_trusted_ca, msg_metadata
+--   roles      <app_role>      default ediplug_app_<env>        login, owner of <app_db>
+--              <admin_role>    default as2_config_admin_<env>   login, owns all <as2_db> tables (single writer)
+--              <runtime_role>  default openas2_<env>            login for the OpenAS2 container: SELECT on the
+--                                                               config/cert tables, SELECT/INSERT/UPDATE on
+--                                                               msg_metadata, owns nothing
 --
--- Run as a login with CREATEDB + CREATEROLE (RDS master user, or e.g. admin_user), connected to database "postgres":
+-- Run as a login with CREATEDB + CREATEROLE (RDS master user or e.g. admin_user), connected to database "postgres":
 --
 --   psql "host=<rds> port=5432 user=<admin> dbname=postgres sslmode=verify-full sslrootcert=ap-south-1-bundle.pem" \
---        -f ediplug_db_bootstrap.sql
+--        -f create_env_databases.sql
 --
--- Values not given are asked for. When the environment name itself was given (-v env / EDIPLUG_ENV), names not given
--- default silently (add -v ask=1 to be asked anyway); missing passwords are always asked for.
--- Ways to give a value (first match wins):
---   1. psql variables:  -v env=dev -v app_db=ediplug-dev -v app_role=... -v as2_db=... -v runtime_role=...
---                       -v admin_role=... -v app_password=... -v runtime_password=... -v admin_password=...
+-- It asks for the environment name, then the database and role names (Enter = default in [brackets]) and a password
+-- for each role that does not exist yet (min. 12 characters; psql shows what you type).
+-- Without prompts (first match wins):
+--   1. psql variables:  -v env=dev -v app_db=... -v app_role=... -v as2_db=... -v runtime_role=... -v admin_role=...
+--                       -v app_password=... -v runtime_password=... -v admin_password=...
 --   2. environment:     EDIPLUG_ENV, EDIPLUG_APP_DB, EDIPLUG_APP_ROLE, EDIPLUG_APP_PASSWORD, OPENAS2_DB,
 --                       OPENAS2_RUNTIME_ROLE, OPENAS2_RUNTIME_PASSWORD, OPENAS2_ADMIN_ROLE, OPENAS2_ADMIN_PASSWORD
---   3. prompt:          press Enter to accept the default in [brackets]. psql shows what you type, so give
---                       passwords through the environment when others can see your screen.
+--   When the environment name is given this way, names not given take their defaults (-v ask=1 asks anyway).
 --
--- Idempotent: existing databases, roles and tables are kept (passwords are only used when a role is created).
--- Afterwards: the orchestrator uses <app_db> and <as2_db> (its `alembic upgrade head` is then a no-op); the OpenAS2
--- container uses AS2_DB_NAME=<as2_db>, AS2_DB_USER=<runtime_role>.
--- Requires psql 15+ (\getenv). The OpenAS2 part is identical to openas2_rds_init.sql.
+-- Idempotent: existing databases, roles and tables are kept; passwords are only used when a role is created.
+-- Requires psql 15+ (\getenv).
 -- =====================================================================================================================
 
 \set ON_ERROR_STOP 1
 \set QUIET 1
+SET client_min_messages = warning;   -- hide "already exists, skipping" notices on re-runs
 
 -- ---------------------------------------------------------------------------------------------------------------------
 -- Inputs: psql variable -> environment variable -> prompt -> default derived from the environment name
@@ -201,336 +201,18 @@ REVOKE ALL    ON DATABASE :"as2_db" FROM PUBLIC;
 GRANT CONNECT ON DATABASE :"as2_db" TO :"runtime_role", :"admin_role";
 
 
--- =====================================================================================================================
--- Application database: EdiPlug orchestrator tables (= Alembic revision 0001, the original Prisma migration)
--- =====================================================================================================================
+-- The application database stays empty here; only its public schema is restricted to the application role
 \connect :"app_db"
+SET client_min_messages = warning;
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 GRANT ALL ON SCHEMA public TO :"app_role";
-
-SELECT to_regclass('public."user"') IS NULL AS need_app_schema \gset
-\if :need_app_schema
-\echo 'Creating application tables in' :app_db
-BEGIN;
--- As the application role, so it owns every table, type and index
-SET LOCAL ROLE :"app_role";
--- CreateSchema
-
-
--- CreateEnum
-CREATE TYPE "UserRole" AS ENUM ('SYSTEM_ADMIN', 'CLIENT_ADMIN', 'CLIENT_USER');
-
--- CreateEnum
-CREATE TYPE "UserStatus" AS ENUM ('ACTIVE', 'INVITED', 'DISABLED');
-
--- CreateEnum
-CREATE TYPE "ClientStatus" AS ENUM ('ONBOARDING', 'ACTIVE', 'INACTIVE', 'SUSPENDED');
-
--- CreateEnum
-CREATE TYPE "PartnerStatus" AS ENUM ('ACTIVE', 'INACTIVE');
-
--- CreateEnum
-CREATE TYPE "MappingStatus" AS ENUM ('ACTIVE', 'INACTIVE', 'PENDING');
-
--- CreateEnum
-CREATE TYPE "DocumentDirection" AS ENUM ('INBOUND', 'OUTBOUND');
-
--- CreateEnum
-CREATE TYPE "TransactionSetType" AS ENUM ('TS_850', 'TS_846', 'TS_855', 'TS_856', 'TS_810', 'TS_820', 'TS_997');
-
--- CreateEnum
-CREATE TYPE "DocumentStatus" AS ENUM ('RECEIVED', 'PARSING', 'PARSED', 'VALIDATION_FAILED', 'READY_TO_SEND', 'SENT', 'ACKNOWLEDGED', 'FAILED');
-
--- CreateTable
-CREATE TABLE "user" (
-    "id" TEXT NOT NULL,
-    "name" TEXT NOT NULL,
-    "email" TEXT NOT NULL,
-    "emailVerified" BOOLEAN NOT NULL DEFAULT false,
-    "image" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "user_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "session" (
-    "id" TEXT NOT NULL,
-    "expiresAt" TIMESTAMP(3) NOT NULL,
-    "token" TEXT NOT NULL,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-    "ipAddress" TEXT,
-    "userAgent" TEXT,
-    "userId" TEXT NOT NULL,
-
-    CONSTRAINT "session_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "account" (
-    "id" TEXT NOT NULL,
-    "accountId" TEXT NOT NULL,
-    "providerId" TEXT NOT NULL,
-    "userId" TEXT NOT NULL,
-    "accessToken" TEXT,
-    "refreshToken" TEXT,
-    "idToken" TEXT,
-    "accessTokenExpiresAt" TIMESTAMP(3),
-    "refreshTokenExpiresAt" TIMESTAMP(3),
-    "scope" TEXT,
-    "password" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "account_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "verification" (
-    "id" TEXT NOT NULL,
-    "identifier" TEXT NOT NULL,
-    "value" TEXT NOT NULL,
-    "expiresAt" TIMESTAMP(3) NOT NULL,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "verification_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "user_profile" (
-    "id" TEXT NOT NULL,
-    "userId" TEXT NOT NULL,
-    "clientId" TEXT,
-    "role" "UserRole" NOT NULL,
-    "status" "UserStatus" NOT NULL DEFAULT 'ACTIVE',
-    "portalAccessScope" JSONB,
-    "createdById" TEXT,
-    "updatedById" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "user_profile_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "clients" (
-    "id" TEXT NOT NULL,
-    "name" TEXT NOT NULL,
-    "slug" TEXT NOT NULL,
-    "status" "ClientStatus" NOT NULL DEFAULT 'ONBOARDING',
-    "contactEmail" TEXT,
-    "settings" JSONB,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "clients_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "partners" (
-    "id" TEXT NOT NULL,
-    "code" TEXT NOT NULL,
-    "name" TEXT NOT NULL,
-    "ediStandard" TEXT NOT NULL DEFAULT 'X12',
-    "status" "PartnerStatus" NOT NULL DEFAULT 'ACTIVE',
-    "supportedTransactionSets" "TransactionSetType"[],
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "partners_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "client_partner_mappings" (
-    "id" TEXT NOT NULL,
-    "clientId" TEXT NOT NULL,
-    "partnerId" TEXT NOT NULL,
-    "status" "MappingStatus" NOT NULL DEFAULT 'PENDING',
-    "clientAs2Config" JSONB,
-    "partnerAs2Config" JSONB,
-    "settings" JSONB,
-    "clientQualifier" TEXT,
-    "clientIsaId" TEXT,
-    "partnerQualifier" TEXT,
-    "partnerIsaId" TEXT,
-    "acknowledgmentRequested" TEXT,
-    "usageIndicator" TEXT,
-    "gsClientCode" TEXT,
-    "gsPartnerCode" TEXT,
-    "activatedAt" TIMESTAMP(3),
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "client_partner_mappings_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "partner_transaction_configs" (
-    "id" TEXT NOT NULL,
-    "partnerId" TEXT NOT NULL,
-    "transactionSet" "TransactionSetType" NOT NULL,
-    "direction" "DocumentDirection",
-    "guidePath" TEXT NOT NULL,
-    "cdoTemplatePath" TEXT NOT NULL,
-    "guideVersion" TEXT NOT NULL,
-    "cdoTemplateVersion" TEXT NOT NULL,
-    "guideChecksum" TEXT,
-    "cdoTemplateChecksum" TEXT,
-    "isActive" BOOLEAN NOT NULL DEFAULT true,
-    "metadata" JSONB,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "partner_transaction_configs_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "documents" (
-    "id" TEXT NOT NULL,
-    "clientId" TEXT NOT NULL,
-    "partnerId" TEXT NOT NULL,
-    "clientPartnerMappingId" TEXT,
-    "transactionSet" "TransactionSetType" NOT NULL,
-    "direction" "DocumentDirection" NOT NULL,
-    "status" "DocumentStatus" NOT NULL DEFAULT 'RECEIVED',
-    "rawEdiPath" TEXT,
-    "cdoJson" JSONB,
-    "validationReport" JSONB,
-    "errorDetails" JSONB,
-    "isaControlNumber" TEXT,
-    "gsControlNumber" TEXT,
-    "stControlNumber" TEXT,
-    "idempotencyKey" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "documents_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "edi_control_counters" (
-    "id" TEXT NOT NULL,
-    "clientPartnerMappingId" TEXT NOT NULL,
-    "nextIsaControlNumber" INTEGER NOT NULL DEFAULT 1,
-    "nextGsControlNumber" INTEGER NOT NULL DEFAULT 1,
-    "nextStControlNumber" INTEGER NOT NULL DEFAULT 1,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "edi_control_counters_pkey" PRIMARY KEY ("id")
-);
-
--- CreateIndex
-CREATE UNIQUE INDEX "user_email_key" ON "user"("email");
-
--- CreateIndex
-CREATE UNIQUE INDEX "session_token_key" ON "session"("token");
-
--- CreateIndex
-CREATE INDEX "session_userId_idx" ON "session"("userId");
-
--- CreateIndex
-CREATE INDEX "account_userId_idx" ON "account"("userId");
-
--- CreateIndex
-CREATE UNIQUE INDEX "account_providerId_accountId_key" ON "account"("providerId", "accountId");
-
--- CreateIndex
-CREATE INDEX "verification_identifier_idx" ON "verification"("identifier");
-
--- CreateIndex
-CREATE UNIQUE INDEX "user_profile_userId_key" ON "user_profile"("userId");
-
--- CreateIndex
-CREATE INDEX "user_profile_clientId_idx" ON "user_profile"("clientId");
-
--- CreateIndex
-CREATE INDEX "user_profile_role_status_idx" ON "user_profile"("role", "status");
-
--- CreateIndex
-CREATE UNIQUE INDEX "clients_slug_key" ON "clients"("slug");
-
--- CreateIndex
-CREATE UNIQUE INDEX "partners_code_key" ON "partners"("code");
-
--- CreateIndex
-CREATE INDEX "client_partner_mappings_partnerId_idx" ON "client_partner_mappings"("partnerId");
-
--- CreateIndex
-CREATE UNIQUE INDEX "client_partner_mappings_clientId_partnerId_key" ON "client_partner_mappings"("clientId", "partnerId");
-
--- CreateIndex
-CREATE INDEX "partner_transaction_configs_partnerId_transactionSet_isActi_idx" ON "partner_transaction_configs"("partnerId", "transactionSet", "isActive");
-
--- CreateIndex
-CREATE UNIQUE INDEX "partner_transaction_configs_partnerId_transactionSet_direct_key" ON "partner_transaction_configs"("partnerId", "transactionSet", "direction", "guideVersion", "cdoTemplateVersion");
-
--- CreateIndex
-CREATE UNIQUE INDEX "documents_idempotencyKey_key" ON "documents"("idempotencyKey");
-
--- CreateIndex
-CREATE INDEX "documents_clientId_createdAt_idx" ON "documents"("clientId", "createdAt");
-
--- CreateIndex
-CREATE INDEX "documents_clientId_partnerId_transactionSet_idx" ON "documents"("clientId", "partnerId", "transactionSet");
-
--- CreateIndex
-CREATE INDEX "documents_status_idx" ON "documents"("status");
-
--- CreateIndex
-CREATE UNIQUE INDEX "edi_control_counters_clientPartnerMappingId_key" ON "edi_control_counters"("clientPartnerMappingId");
-
--- AddForeignKey
-ALTER TABLE "session" ADD CONSTRAINT "session_userId_fkey" FOREIGN KEY ("userId") REFERENCES "user"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "account" ADD CONSTRAINT "account_userId_fkey" FOREIGN KEY ("userId") REFERENCES "user"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "user_profile" ADD CONSTRAINT "user_profile_userId_fkey" FOREIGN KEY ("userId") REFERENCES "user"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "user_profile" ADD CONSTRAINT "user_profile_clientId_fkey" FOREIGN KEY ("clientId") REFERENCES "clients"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "client_partner_mappings" ADD CONSTRAINT "client_partner_mappings_clientId_fkey" FOREIGN KEY ("clientId") REFERENCES "clients"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "client_partner_mappings" ADD CONSTRAINT "client_partner_mappings_partnerId_fkey" FOREIGN KEY ("partnerId") REFERENCES "partners"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "partner_transaction_configs" ADD CONSTRAINT "partner_transaction_configs_partnerId_fkey" FOREIGN KEY ("partnerId") REFERENCES "partners"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "documents" ADD CONSTRAINT "documents_clientId_fkey" FOREIGN KEY ("clientId") REFERENCES "clients"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "documents" ADD CONSTRAINT "documents_partnerId_fkey" FOREIGN KEY ("partnerId") REFERENCES "partners"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "documents" ADD CONSTRAINT "documents_clientPartnerMappingId_fkey" FOREIGN KEY ("clientPartnerMappingId") REFERENCES "client_partner_mappings"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "edi_control_counters" ADD CONSTRAINT "edi_control_counters_clientPartnerMappingId_fkey" FOREIGN KEY ("clientPartnerMappingId") REFERENCES "client_partner_mappings"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
-CREATE TABLE alembic_version (
-    version_num VARCHAR(32) NOT NULL,
-    CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
-);
-INSERT INTO alembic_version (version_num) VALUES ('0001');
-COMMIT;
-\else
-\echo 'Application tables already exist in' :app_db '- kept'
-\endif
 
 
 -- =====================================================================================================================
 -- OpenAS2 database: configuration (partners, partnerships, keys, certificates), change counters, message tracking
 -- =====================================================================================================================
 \connect :"as2_db"
+SET client_min_messages = warning;
 \echo 'Creating / checking OpenAS2 tables in' :as2_db
 BEGIN;
 
@@ -817,7 +499,7 @@ GRANT USAGE                  ON SEQUENCE msg_metadata_id_seq TO :"runtime_role";
 COMMIT;
 
 -- Done. Next: load partners/partnerships, own keys (encrypted with AS2_KEY_ENCRYPTION_PASSWORD) and partner
--- certificates as as2_config_admin, then start the OpenAS2 container with AS2_DB_USER=openas2.
+-- certificates as <admin_role>, then start the OpenAS2 container with AS2_DB_USER=<runtime_role>.
 
 \echo
 \echo 'Done. Connection settings:'

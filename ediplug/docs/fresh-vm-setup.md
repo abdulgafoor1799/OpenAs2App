@@ -54,21 +54,22 @@ Files: `ediplug/deploy/` in the `ediplug/db-config` branch of the OpenAs2App for
 
 ## 2. Database (once per environment)
 
-As the RDS master user, from any host that can reach RDS (the VM itself, or a bastion), run the single init
-script. It creates the database, both roles, every table, the triggers and the grants, and is idempotent:
+As the RDS master user, from any host that can reach RDS (the VM itself, or a bastion), run the single script.
+It creates the environment's two databases (`ediplug-<env>` empty, `openas2-<env>` with every table, trigger and
+grant) and the three roles, asks for anything not given, and is idempotent:
 
 ```sh
-curl -fsSo global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
-psql "host=<rds-endpoint> user=<master> dbname=postgres sslmode=verify-full sslrootcert=global-bundle.pem" \
-     -v ON_ERROR_STOP=1 -v openas2_password='<runtime role password>' -v admin_password='<writer role password>' \
-     -f ediplug/db/openas2_rds_init.sql
+curl -fsSo ap-south-1-bundle.pem https://truststore.pki.rds.amazonaws.com/ap-south-1/ap-south-1-bundle.pem
+EDIPLUG_ENV=prod EDIPLUG_APP_PASSWORD='<app role>' OPENAS2_RUNTIME_PASSWORD='<runtime role>' \
+OPENAS2_ADMIN_PASSWORD='<writer role>' \
+psql "host=<rds-endpoint> user=<master> dbname=postgres sslmode=verify-full sslrootcert=ap-south-1-bundle.pem" \
+     -f ediplug/db/create_env_databases.sql
 ```
 
-- `openas2` (runtime, used by the container): SELECT on config/certificate tables, SELECT/INSERT/UPDATE on
-  `msg_metadata`, owns nothing.
-- `as2_config_admin` (writer: migrations, EDIPLUG backend): owns every table.
-- `ediplug/db/V1`..`V5` are the incremental upgrade path for the old (pre-RDS) database only; a fresh database
-  uses `openas2_rds_init.sql`.
+- `openas2_<env>` (runtime, used by the container): SELECT on config/certificate tables, SELECT/INSERT/UPDATE on
+  `msg_metadata`, owns nothing. Use it as `AS2_DB_USER`, with `AS2_DB_NAME=openas2-<env>`.
+- `as2_config_admin_<env>` (writer: the orchestrator): owns every table.
+- `ediplug_app_<env>`: owner of `ediplug-<env>` (orchestrator tables come from its Alembic migrations).
 
 Load data, either by **copying from the current server**:
 
