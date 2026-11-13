@@ -86,6 +86,7 @@
                pollerConfigBase.process_files_in_parallel="false"
                pollerConfigBase.max_parallel_files="20"
                pollerConfigBase.max_file_processing_time_minutes="30"
+               pollerConfigBase.fileextensionfilter=""
                partnerships.polling.interval="120"
                messages.enabled="false"
                messages.polling.interval="120"
@@ -263,7 +264,8 @@
            mimetype="$properties.pollerConfigBase.mimetype$"
            process_files_in_parallel="$properties.pollerConfigBase.process_files_in_parallel$"
            max_parallel_files="$properties.pollerConfigBase.max_parallel_files$"
-           max_file_processing_time_minutes="$properties.pollerConfigBase.max_file_processing_time_minutes$" />
+           max_file_processing_time_minutes="$properties.pollerConfigBase.max_file_processing_time_minutes$"
+           fileextensionfilter="$properties.pollerConfigBase.fileextensionfilter$" />
    <!-- EDIPLUG: partners and partnerships are read from PostgreSQL (tables partner, partner_attribute,
         partnership, partnership_attribute). They are owned by the EDIPLUG backend; OpenAS2 only reads them.
         Connection settings come from openas2.properties, which takes them from environment variables. -->

@@ -314,6 +314,33 @@ CREATE TABLE IF NOT EXISTS partnership_attribute
 CREATE UNIQUE INDEX IF NOT EXISTS partnership_attribute_unique
     ON partnership_attribute (partnership_id, category, attribute_name);
 
+-- Values OpenAS2 cannot load. A NULL attribute value aborts the whole partnership reload (NPE in
+-- AS2Util.attributeEnhancer); a non-numeric resend_max_retries throws per message. The admin API never writes
+-- either; these guards also cover direct SQL. Added idempotently so re-running this script upgrades an existing DB
+-- (NOT NULL is only applied when no NULL value is present, otherwise a NOTICE lists what to fix).
+DO $$
+DECLARE
+    t        text;
+    has_null boolean;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['partner_attribute', 'partnership_attribute'] LOOP
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema()
+                       AND table_name = t AND column_name = 'attribute_value' AND is_nullable = 'NO') THEN
+            EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I WHERE attribute_value IS NULL)', t) INTO has_null;
+            IF NOT has_null THEN
+                EXECUTE format('ALTER TABLE %I ALTER COLUMN attribute_value SET NOT NULL', t);
+            ELSE
+                RAISE NOTICE '%.attribute_value has NULL rows: fix them, then re-run to add NOT NULL', t;
+            END IF;
+        END IF;
+    END LOOP;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'partnership_attribute_resend_max_retries_int') THEN
+        ALTER TABLE partnership_attribute ADD CONSTRAINT partnership_attribute_resend_max_retries_int
+            CHECK (attribute_name <> 'resend_max_retries' OR attribute_value ~ '^-?[0-9]+$') NOT VALID;
+    END IF;
+END
+$$;
+
 
 -- =====================================================================================================================
 -- V2: change counters. OpenAS2 polls only these rows (every 30 s) and reloads an area when its version changes.
