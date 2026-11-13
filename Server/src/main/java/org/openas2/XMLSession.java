@@ -165,7 +165,9 @@ public class XMLSession extends BaseSession {
                     String key = (String) enuKeys.nextElement();
                     String val = envVarReplacer.replace(appProps.getProperty(key));
                     Properties.setProperty(key, val);
-                    LOGGER.debug("Adding OpenAS2 properties file property: {} : {}", key, val);
+                    // EDIPLUG: property values are not logged; they include secrets (DB, keystore and key passwords).
+                    // LOGGER.debug("Adding OpenAS2 properties file property: {} : {}", key, val);
+                    LOGGER.debug("Adding OpenAS2 properties file property: {}", key);
                 }
 
             } catch (FileNotFoundException e) {
@@ -192,11 +194,15 @@ public class XMLSession extends BaseSession {
         for (Map.Entry<String, String> entry : Properties.getProperties().entrySet()) {
             String key = entry.getKey();
             String val = entry.getValue();
-            LOGGER.debug("Parsing property: {} : {}", key, val);
+            // EDIPLUG: values not logged (secrets)
+            // LOGGER.debug("Parsing property: {} : {}", key, val);
+            LOGGER.debug("Parsing property: {}", key);
             String parsedVal = ParameterParser.parse(val, parser);
             // Parser will return empty string if there is an unmatched parser ID in the string
             if (parsedVal.length() > 0 && !val.equals(parsedVal)) {
-                LOGGER.debug("Overriding property with new parsed value: {} : {}", key, parsedVal);
+                // EDIPLUG: values not logged (secrets)
+                // LOGGER.debug("Overriding property with new parsed value: {} : {}", key, parsedVal);
+                LOGGER.debug("Overriding property with new parsed value: {}", key);
                 // Put the changed value into the Properties set
                 Properties.setProperty(key, parsedVal);
             }
