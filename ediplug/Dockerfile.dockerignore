@@ -1,0 +1,10 @@
+# Build context of ediplug/Dockerfile (BuildKit reads <Dockerfile>.dockerignore). Docs, deploy files and SQL are not
+# part of the image, so editing them does not invalidate the Maven build layer.
+.git
+target
+**/target
+ediplug/docs
+ediplug/deploy
+ediplug/db
+ediplug/tools
+ediplug/*.md

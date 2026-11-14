@@ -30,7 +30,7 @@ services:
       autoheal: "true"
 
   openas2:
-    image: ${OPENAS2_IMAGE:?set OPENAS2_IMAGE in .env}   # e.g. <account>.dkr.ecr.<region>.amazonaws.com/ediplug-openas2:4.15.0-ediplug-s5
+    image: ${OPENAS2_IMAGE:?set OPENAS2_IMAGE in .env}   # e.g. <account>.dkr.ecr.<region>.amazonaws.com/openas2-ediplug:multiarch-v2
     container_name: EDIPLUG_AS2_SERVER
     restart: always
     init: true
@@ -49,9 +49,13 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       OPENAS2_LOG_LEVEL: ${OPENAS2_LOG_LEVEL:-INFO}
+      OPENAS2_PROPERTIES_OVERRIDE_MODE: ${OPENAS2_PROPERTIES_OVERRIDE_MODE:-merge}   # merge | replace
     volumes:
       # inbox / outbox / MDNs / pending state; must be writable by UID 1000 (chown -R 1000:0 ./data)
       - ./data:/opt/openas2/data:rw
+      # optional runtime properties: put openas2.properties in ./override (see override/openas2.properties.example);
+      # folder empty = image defaults. Read at container start, so restart after editing.
+      - ./override:/opt/openas2/override:ro
     expose: ["10080", "10081", "10099"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:10099/"]

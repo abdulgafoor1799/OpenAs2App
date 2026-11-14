@@ -15,7 +15,8 @@ Trading partners --HTTPS--> DNS as2.ediplug.com --> Load balancer (TLS, ACM cert
 What lives where:
 - **Image (ECR)**: OpenAS2 4.15 + EDIPLUG code + all static config (`config.xml`, `openas2.properties`, logback, CA bundles).
 - **RDS**: everything that changes at runtime. A new VM needs no partner, key or certificate files.
-- **VM**: `docker-compose.yml`, `nginx/nginx.conf`, `.env` (secrets) and `./data` (inbox, outbox, MDNs, pending state).
+- **VM**: `docker-compose.yml`, `nginx/nginx.conf`, `.env` (secrets), optional `override/openas2.properties` (runtime
+  property changes) and `./data` (inbox, outbox, MDNs, pending state). See `runtime-setup.md`.
 
 Files: `ediplug/deploy/` in the `ediplug/db-config` branch of the OpenAs2App fork.
 
@@ -23,9 +24,8 @@ Files: `ediplug/deploy/` in the `ediplug/db-config` branch of the OpenAs2App for
 
 ## 0. Decisions before you start
 
-1. **CPU architecture.** The image is built on the current ARM64 VM, so it runs on ARM64 hosts (AWS Graviton:
-   t4g / m7g / c7g). For x86 instances, build a multi-arch image (`docker buildx build --platform
-   linux/amd64,linux/arm64 ...`).
+1. **CPU architecture.** `openas2-ediplug:multiarch-v2` runs on ARM64 (AWS Graviton t4g / m7g / c7g, OCI Ampere)
+   and x86-64 hosts; `arm64-v2` / `x86-v2` are the single-architecture builds.
 2. **Load balancer type.**
    - **NLB** (recommended for AS2): static Elastic IPs per AZ, which many retailers require for firewall
      allowlisting. Use a **TLS listener on 443 with the ACM certificate**, forwarding TCP to target port 80. To see
@@ -36,15 +36,15 @@ Files: `ediplug/deploy/` in the `ediplug/db-config` branch of the OpenAs2App for
    - Either way: health check `HTTP GET /health` on port 80, healthy 200, interval 30 s.
 3. **One active node at a time.** Outbox, pending-MDN and resend state live in the node's local `./data`. An
    asynchronous MDN that lands on another node cannot be matched to its message. Run a single active target
-   (keep a stopped standby, or a second target only for failover) until `./data` is on shared storage (e.g. EFS)
-   and tested with two nodes.
+   (keep a stopped standby, or a second target only for failover). Active-passive with `./data` on shared storage
+   (OCI File Storage / AWS EFS) is described in `runtime-setup.md`; never run two OpenAS2 on the same data.
 
 ## 1. AWS resources (once per environment)
 
 | Resource | Settings |
 |---|---|
-| ECR repository | `ediplug-openas2`, immutable tags, scan on push |
-| RDS PostgreSQL 16 | Multi-AZ, encrypted, not publicly accessible, parameter `rds.force_ssl=1` |
+| ECR repository | `openas2-ediplug`, scan on push (mutable tags if you use `latest`) |
+| RDS PostgreSQL 16+ (tested on 18.3) | Multi-AZ, encrypted, not publicly accessible, parameter `rds.force_ssl=1` |
 | Security group `as2-lb` | inbound 443 from partners (or 0.0.0.0/0) |
 | Security group `as2-node` | inbound 80 **only from `as2-lb`**; SSH only from your admin IP / SSM |
 | Security group `as2-db` | inbound 5432 only from `as2-node` |
@@ -71,16 +71,16 @@ psql "host=<rds-endpoint> user=<master> dbname=postgres sslmode=verify-full sslr
 - `as2_config_admin_<env>` (writer: the orchestrator): owns every table.
 - `ediplug_app_<env>`: owner of `ediplug-<env>` (orchestrator tables come from its Alembic migrations).
 
-Load data, either by **copying from the current server**:
+Load data, either by **copying from another environment's database** (e.g. an existing `openas2-<env>`):
 
 ```sh
-# on the current VM (local postgres container)
-docker exec ediplug-postgres pg_dump -U postgres -Fc --data-only \
+pg_dump "host=<source-host> user=<source owner> dbname=<source db> sslmode=verify-full sslrootcert=ap-south-1-bundle.pem" \
+  -Fc --data-only \
   -t partner -t partner_attribute -t partnership -t partnership_attribute \
-  -t as2_own_key -t as2_partner_certificate -t as2_ssl_trusted_ca -t msg_metadata \
-  openas2 > openas2-data.dump
-# into RDS, triggers enabled (version counters and alias checks run; config_version is seeded by V2)
-pg_restore -U as2_config_admin -d openas2 --data-only --single-transaction openas2-data.dump
+  -t as2_own_key -t as2_partner_certificate -t as2_ssl_trusted_ca -t msg_metadata > openas2-data.dump
+# into the new database as its admin role, triggers enabled (version counters and alias checks run;
+# config_version is seeded by create_env_databases.sql)
+pg_restore -h <rds-endpoint> -U as2_config_admin_<env> -d openas2-<env> --data-only --single-transaction openas2-data.dump
 ```
 
 or **from scratch** with the tools in the image (see `ediplug/README.md`):
@@ -92,13 +92,18 @@ a password manager / AWS Secrets Manager: without it the keys in the database ca
 
 ## 3. Image (each release)
 
-On a build host with the repository (and buildx for multi-arch):
+On a build host with the repository, Docker buildx and (on an ARM64 host, for the x86 variant) QEMU
+(`sudo apt-get install docker-buildx qemu-user-static`):
 
 ```sh
-docker build -f ediplug/Dockerfile -t ediplug-openas2:4.15.0-ediplug-s5 .          # runs the test suite
-aws ecr get-login-password --region <region> | docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
-docker tag ediplug-openas2:4.15.0-ediplug-s5 <account>.dkr.ecr.<region>.amazonaws.com/ediplug-openas2:4.15.0-ediplug-s5
-docker push <account>.dkr.ecr.<region>.amazonaws.com/ediplug-openas2:4.15.0-ediplug-s5
+REG=<account>.dkr.ecr.<region>.amazonaws.com
+aws ecr get-login-password --region <region> | docker login --username AWS --password-stdin $REG
+# multi-arch (both architectures under one tag), straight to ECR; runs the test suite
+docker buildx build -f ediplug/Dockerfile --platform linux/amd64,linux/arm64 \
+  -t $REG/openas2-ediplug:multiarch-v2 -t $REG/openas2-ediplug:latest --push .
+# single-architecture tags, if wanted
+docker buildx build -f ediplug/Dockerfile --platform linux/arm64 -t $REG/openas2-ediplug:arm64-v2 --push .
+docker buildx build -f ediplug/Dockerfile --platform linux/amd64 -t $REG/openas2-ediplug:x86-v2 --push .
 ```
 
 ## 4. The VM
@@ -122,9 +127,10 @@ unzip -q awscliv2.zip && sudo ./aws/install && rm -rf aws awscliv2.zip
 
 # Deployment folder
 sudo mkdir -p /opt/ediplug && sudo chown ubuntu: /opt/ediplug && cd /opt/ediplug
-#   copy ediplug/deploy/{docker-compose.yml,.env.example,nginx/nginx.conf} here
+#   copy ediplug/deploy/{docker-compose.yml,.env.example,nginx/nginx.conf,override/} here
 cp .env.example .env && chmod 600 .env && nano .env      # fill in every <...>
 mkdir -p data && sudo chown -R 1000:0 data && sudo chmod -R g+rwX data
+#   optional property changes: cp override/openas2.properties.example override/openas2.properties, keep only changed keys
 #   edit nginx/nginx.conf: set_real_ip_from = your VPC / LB subnets (and proxy_protocol for an NLB)
 
 # Start
@@ -140,7 +146,7 @@ Make it survive reboots: Docker starts on boot and the containers have `restart:
 
 ```sh
 docker compose ps                                   # all three healthy
-docker logs EDIPLUG_AS2_SERVER 2>&1 | grep -E "Loaded|ERROR|started"
+docker logs EDIPLUG_AS2_SERVER 2>&1 | grep -E "ediplug-entrypoint|Loaded|ERROR|started"
 #   expect: "Loaded N own key pairs and M partner certificates ... into keystore as2_certs"
 #           "Loaded ... into keystore ssl_trust_certs", "Loaded P partners and Q partnerships", "OpenAS2 Server v4.15.0 started."
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost/health          # 200 on the VM
@@ -153,7 +159,9 @@ Then send a test file through a test partnership (drop it in `data/outbox/<sende
 Startup failures to expect, and fixes:
 - `AS2 keystore validation failed`: DB unreachable (security groups, `AS2_DB_*`), wrong
   `AS2_KEY_ENCRYPTION_PASSWORD`, or a broken own key row. The log lists every problem.
-- `Permission denied` on `/opt/openas2/data`: `sudo chown -R 1000:0 data`.
+- `data directory ... is not writable` / `Permission denied` on `/opt/openas2/data`: `sudo chown -R 1000:0 data`.
+- `... is not a file`: the override mount points at a missing file (Docker then creates a directory); mount the
+  `override/` folder instead.
 - Partner-level ERRORs (missing partner certificate, expired certificate): the node runs; only those partners fail.
 
 ## 6. Moving traffic from an existing node
@@ -171,6 +179,7 @@ Startup failures to expect, and fixes:
 | Task | How |
 |---|---|
 | Release a new image | push a new tag, set `OPENAS2_IMAGE` in `.env`, `docker compose pull && docker compose up -d openas2` (about 10 s outage while the container restarts) |
+| Change a property | edit `override/openas2.properties`, `docker compose restart openas2`; the log lists the overridden keys |
 | Roll back | previous tag in `.env`, `docker compose up -d openas2`; DB migrations are additive |
 | Add/rotate partners, certificates, trusted CAs | write the tables; live within ~30 s, no restart (see `keystore-and-reloads.md`) |
 | Logs | `docker logs EDIPLUG_AS2_SERVER` (json-file, rotated 5 x 50 MB); ERRORs are also emailed |

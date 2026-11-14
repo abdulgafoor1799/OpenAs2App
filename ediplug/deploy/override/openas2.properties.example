@@ -1,0 +1,26 @@
+# Runtime overrides for the OpenAS2 image (s7 / *-v2 and later).
+# Copy to override/openas2.properties (same folder), keep only the keys you change, then restart the container:
+#   docker compose up -d --force-recreate openas2      (or: docker compose restart openas2)
+#
+# Merge mode (default): these keys replace the image's values, every other key keeps the image value.
+# Set OPENAS2_PROPERTIES_OVERRIDE_MODE=replace in .env to use this file INSTEAD of the image's file (then it must be
+# complete: start from `docker run --rm --entrypoint cat <image> /opt/openas2/config_template/openas2.properties`).
+#
+# No secrets here: reference environment variables with $ENV{NAME} (an unset variable stops OpenAS2 at startup).
+# Image defaults: ediplug/config/openas2.properties (config.xml <properties> for keys not in that file).
+
+# Outbox file filter for every partnership poller (empty = every file)
+#pollerConfigBase.fileextensionfilter=edi,EDI,xml,XML
+
+# Public URL partners send asynchronous MDNs to
+#as2_async_mdn_url=https://as2-dev.ediplug.com/mdn
+
+# How often the DB version counters are checked (seconds)
+#partnerships.polling.interval=30
+#as2_certs.polling.interval=30
+
+# Data directory inside the container. Only change it together with the volume mount in docker-compose.yml.
+#storageBaseDir=/opt/openas2/data
+
+# Resend attempts after a failed send
+#processor.resend_max_retries=5

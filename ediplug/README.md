@@ -5,6 +5,7 @@ OpenAS2 4.15 with EDIPLUG's configuration baked into the image. Runtime data liv
 | What | Where | Who writes it | How OpenAS2 picks up changes |
 |---|---|---|---|
 | Static config (`config.xml`, `openas2.properties`, `logback.xml`, CA certs) | `ediplug/config/` → image `config_template` | this repo | rebuild image |
+| Runtime property changes (any `openas2.properties` key) | `override/openas2.properties` mounted at `/opt/openas2/override` | ops (per environment) | container restart |
 | Partners and partnerships | tables `partner`, `partner_attribute`, `partnership`, `partnership_attribute` | EDIPLUG backend | version counter polled every 30s |
 | Key pairs of the AS2 IDs we host (own IDs, operated suppliers, test IDs) | table `as2_own_key` (private key as encrypted PKCS#8 PEM + cert chain) | EDIPLUG backend | version counter polled every 30s |
 | Partner (retailer) public certificates | table `as2_partner_certificate` | EDIPLUG backend | version counter polled every 30s |
@@ -13,7 +14,7 @@ OpenAS2 4.15 with EDIPLUG's configuration baked into the image. Runtime data liv
 
 OpenAS2 only **reads** these tables (DB role `openas2` has `SELECT` only); its partner/partnership/cert
 modification commands are not used. A trigger on every table increments `config_version.version` for the
-area (`partnerships` / `certificates`), and OpenAS2 reloads only when that number changes. A full reload
+area (`partnerships` / `certificates` / `ssl_trust`), and OpenAS2 reloads only when that number changes. A full reload
 also happens every hour as a safety net.
 
 Code changes on top of upstream:
@@ -21,22 +22,64 @@ Code changes on top of upstream:
   touching pollers, so a DB error keeps the current partnerships and outbox pollers running.
 - `DbCertificateFactory` (new, read-only): own key pairs from `as2_own_key` + partner certs from
   `as2_partner_certificate`, validated against the partner tables, assembled into a new in-memory keystore and
-  published atomically. No keystore file exists anywhere. Any validation error stops the server at startup;
-  on a reload it keeps the current keystore.
+  published atomically. No keystore file exists anywhere. Database and own-key errors stop the server at startup
+  (a reload keeps the current keystore); partner-level problems only affect that partner (see Validation).
 - `X509CertificateFactory.keyStore` is `volatile`.
+- `XMLSession` no longer logs property values (they include secrets).
+- Container entrypoint `ediplug/bin/ediplug-entrypoint.sh`: runtime `openas2.properties` override and a data
+  directory write check, then the stock `start-container.sh`.
+
+## Files in this folder
+
+| Path | Purpose |
+|---|---|
+| `Dockerfile` | builds the image: Maven build + tests (runs once, natively, for every target architecture), then the JRE runtime with `config/` baked into `/opt/openas2/config_template` |
+| `Dockerfile.dockerignore` | build context for that Dockerfile; leaves out docs, deploy files and SQL so editing them does not rebuild Java |
+| `bin/ediplug-entrypoint.sh` | container entrypoint: fills `config/` on a fresh container, builds the effective `openas2.properties` (image file + optional override), checks the data directory, then starts OpenAS2 |
+| `config/config.xml` | OpenAS2 4.15 configuration: modules, pollers, `DbPartnershipFactory`, two `DbCertificateFactory` stores (`as2_certs`, `ssl_trust_certs`), all DB settings via `$properties.*$` |
+| `config/openas2.properties` | EDIPLUG values for `config.xml` properties: DB URL from `$ENV{AS2_DB_*}`, polling intervals, folder layouts, Message-ID formats, MDN URL, outbox file filter, health check |
+| `config/logback.xml` | logging: console (`docker logs`), daily file in `/opt/openas2/logs`, ERROR e-mail via `SMTP_*` |
+| `config/rds-global-bundle.pem` | AWS RDS CA bundle (`AS2_DB_SSLMODE=verify-full`) |
+| `config/db-ca.pem` | CA of the former local PostgreSQL container (only for a self-hosted DB with that CA) |
+| `db/create_env_databases.sql` | creates one environment's databases (`ediplug-<env>`, `openas2-<env>`), roles, tables, triggers and grants; idempotent |
+| `deploy/docker-compose.yml` | server node: nginx (LB target :80) → OpenAS2, plus autoheal |
+| `deploy/docker-compose.local.yml` | developer machine (Windows/Linux): OpenAS2 only, ports on localhost |
+| `deploy/nginx/nginx.conf` | routes `/receive` (AS2 receive), `/mdn` (async MDN), `/health` to OpenAS2, everything else 403; real client IP from the LB |
+| `deploy/.env.example` | every environment variable with placeholders (copy to `.env`, never commit it) |
+| `deploy/override/openas2.properties.example` | template for runtime property overrides |
+| `tools/p12-to-own-key-sql.sh` | one-off: converts key pairs from a `.p12` into encrypted `as2_own_key` upserts |
+| `docs/runtime-setup.md` | data directory + runtime properties on Windows, Linux VMs and an active-passive pair with shared storage (OCI FSS) |
+| `docs/fresh-vm-setup.md` | full first deployment of a node behind a load balancer (RDS, ECR, verification, operations) |
+| `docs/keystore-and-reloads.md` | how keys, certificates, trusted CAs and partnerships load and hot-swap |
+| `docs/legacy-4.8.2-properties.md` | reference: effective properties of the old 4.8.2 server |
 
 ## Further documentation
 
+- `ediplug/docs/runtime-setup.md`: data directory and runtime properties (Windows, Linux VM, active-passive on OCI)
 - `ediplug/docs/keystore-and-reloads.md`: how keys, certificates, trusted CAs and partnerships are loaded and hot-swapped
 - `ediplug/docs/fresh-vm-setup.md`: bringing up a node on a fresh VM behind a load balancer (AWS RDS + ECR)
-- `ediplug/deploy/`: docker-compose.yml (nginx + OpenAS2 + autoheal), nginx.conf for a load balancer, .env.example
+- `ediplug/deploy/`: docker-compose.yml (nginx + OpenAS2 + autoheal), docker-compose.local.yml, nginx.conf for a load
+  balancer, .env.example, override/
 
 ## Build
 
+From the repository root. Needs Docker with buildx; on an ARM64 host, x86 builds also need QEMU
+(`sudo apt-get install docker-buildx qemu-user-static`).
+
 ```sh
-docker build -f ediplug/Dockerfile -t openas2:4.15.0-ediplug-s3 .                              # with tests
-docker build -f ediplug/Dockerfile --build-arg SKIP_TESTS=true -t openas2:4.15.0-ediplug-s3 .  # quick
+# one architecture (the host's)
+docker build -f ediplug/Dockerfile -t openas2-ediplug:arm64-v2 .                                    # with tests
+docker build -f ediplug/Dockerfile --build-arg SKIP_TESTS=true -t openas2-ediplug:arm64-v2 .        # quick
+# another architecture / both (a multi-arch tag needs the containerd image store or --push)
+docker buildx build -f ediplug/Dockerfile --platform linux/amd64 -t openas2-ediplug:x86-v2 --load .
+docker buildx build -f ediplug/Dockerfile --platform linux/amd64,linux/arm64 -t openas2-ediplug:multiarch-v2 --load .
 ```
+
+| Tag | Architecture | Same as |
+|---|---|---|
+| `multiarch-v2`, `latest` | linux/arm64 + linux/amd64 | `openas2:4.15.0-ediplug-s7` |
+| `arm64-v2` | linux/arm64 (Ampere, Graviton, Apple silicon) | |
+| `x86-v2` | linux/amd64 (Windows 11 / Docker Desktop on Intel/AMD, x86 VMs) | |
 
 ## Environment
 
@@ -49,8 +92,11 @@ docker build -f ediplug/Dockerfile --build-arg SKIP_TESTS=true -t openas2:4.15.0
 | `AS2_KEY_ENCRYPTION_PASSWORD` | passphrase of the encrypted private keys in `as2_own_key` (never stored in the DB) |
 | `AS2_KEYSTORE_PASSWORD` | protects entries of the in-memory keystore only |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` | error alert email |
+| `OPENAS2_PROPERTIES_OVERRIDE_MODE` | `merge` (default: override keys win over the image's) or `replace` (override file only) |
+| `OPENAS2_PROPERTIES_OVERRIDE` | override file path, default `/opt/openas2/override/openas2.properties` |
 
-Mounts: `/opt/openas2/data` only (inbox/outbox/MDN, writable by UID 1000). No config or key files are mounted.
+Mounts: `/opt/openas2/data` (inbox/outbox/MDN, writable by UID 1000) and optionally `/opt/openas2/override`
+(read-only folder with `openas2.properties`). No config or key files are mounted. Details: `docs/runtime-setup.md`.
 
 ## Database setup
 
@@ -81,7 +127,7 @@ Partnerships (XML → DB), using the tool shipped in the image:
 
 ```sh
 docker run --rm --network <net> -v $PWD:/mig:ro --entrypoint /opt/openas2/bin/upgrade/migrate_partnerships_to_db.sh \
-  openas2:4.15.0-ediplug-s3 /mig/partnerships.xml "jdbc:postgresql://<host>:5432/openas2?sslmode=verify-ca&sslrootcert=/opt/openas2/config_template/db-ca.pem" \
+  openas2-ediplug:multiarch-v2 /mig/partnerships.xml "jdbc:postgresql://<host>:5432/openas2?sslmode=verify-ca&sslrootcert=/opt/openas2/config_template/db-ca.pem" \
   <admin user> <password> --dry-run      # then again without --dry-run
 ```
 
@@ -89,7 +135,7 @@ Own key pairs from an existing PKCS12 keystore (one-off; plaintext keys stay in 
 
 ```sh
 docker run --rm --tmpfs /tmp -e P12_PASSWORD -e AS2_KEY_ENCRYPTION_PASSWORD -v $PWD/ediplug/tools:/tools:ro \
-  -v /path/to/as2_certs.p12:/in.p12:ro --entrypoint sh openas2:4.15.0-ediplug-s4 \
+  -v /path/to/as2_certs.p12:/in.p12:ro --entrypoint sh openas2-ediplug:multiarch-v2 \
   /tools/p12-to-own-key-sql.sh /in.p12 ediplug_as2 ediplug_sana_as2 | psql -v ON_ERROR_STOP=1 -d openas2
 ```
 
@@ -138,7 +184,7 @@ VALUES ('rithumas2', $pem$-----BEGIN CERTIFICATE-----
 ON CONFLICT (alias) DO UPDATE SET cert_pem = EXCLUDED.cert_pem, updated_at = now();
 ```
 
-OpenAS2 logs `Certificate version changed ... reloading keystore` within ~10s. To disable a certificate set
+OpenAS2 logs `Certificate version changed ... reloading keystore` within ~30s. To disable a certificate set
 `enabled = false`.
 
 ## Rollback

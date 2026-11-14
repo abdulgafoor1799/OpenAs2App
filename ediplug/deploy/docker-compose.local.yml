@@ -1,0 +1,44 @@
+# Local / developer run of OpenAS2 only (no nginx, no autoheal), e.g. Docker Desktop on Windows 11 or a Linux laptop.
+# Ports are published on localhost: 10080 receive AS2, 10081 receive async MDN, 10099 health.
+#   cp .env.example .env    # fill in; OPENAS2_IMAGE=openas2-ediplug:x86-v2 (Intel/AMD PC) or :arm64-v2 / :multiarch-v2
+#   docker compose -f docker-compose.local.yml up -d
+name: ediplug-as2-local
+
+services:
+  openas2:
+    image: ${OPENAS2_IMAGE:?set OPENAS2_IMAGE in .env}
+    container_name: EDIPLUG_AS2_LOCAL
+    restart: unless-stopped
+    init: true
+    environment:
+      AS2_DB_HOST: ${AS2_DB_HOST:?}
+      AS2_DB_PORT: ${AS2_DB_PORT:-5432}
+      AS2_DB_NAME: ${AS2_DB_NAME:-openas2}
+      AS2_DB_USER: ${AS2_DB_USER:-openas2}
+      AS2_DB_PASSWORD: ${AS2_DB_PASSWORD:?}
+      AS2_DB_SSLMODE: ${AS2_DB_SSLMODE:-verify-full}
+      AS2_DB_SSLROOTCERT: ${AS2_DB_SSLROOTCERT:-/opt/openas2/config/rds-global-bundle.pem}
+      AS2_KEY_ENCRYPTION_PASSWORD: ${AS2_KEY_ENCRYPTION_PASSWORD:?}
+      AS2_KEYSTORE_PASSWORD: ${AS2_KEYSTORE_PASSWORD:?}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      OPENAS2_LOG_LEVEL: ${OPENAS2_LOG_LEVEL:-INFO}
+      OPENAS2_PROPERTIES_OVERRIDE_MODE: ${OPENAS2_PROPERTIES_OVERRIDE_MODE:-merge}
+    volumes:
+      - ${AS2_DATA_DIR:-./data}:/opt/openas2/data:rw      # host folder (or a named volume, see below)
+      - ./override:/opt/openas2/override:ro              # optional override/openas2.properties
+    ports:
+      - "127.0.0.1:10080:10080"
+      - "127.0.0.1:10081:10081"
+      - "127.0.0.1:10099:10099"
+    stop_grace_period: 40s
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
+# Named volume instead of a host folder (fastest on Docker Desktop when the project sits on C:\):
+#   set AS2_DATA_DIR=as2data in .env and uncomment:
+# volumes:
+#   as2data:
