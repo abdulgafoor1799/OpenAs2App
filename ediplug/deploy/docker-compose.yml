@@ -70,7 +70,10 @@ services:
       autoheal: "true"
 
   autoheal:
-    image: willfarrell/autoheal:1.2.0
+    # Pinned by digest (multi-arch index of 1.2.0): this container controls Docker on the host, so a re-pushed tag
+    # must never be picked up silently. To update: docker buildx imagetools inspect willfarrell/autoheal:<new tag>,
+    # review the release, then replace tag and digest here.
+    image: willfarrell/autoheal:1.2.0@sha256:31f580ef0279eaced5b38d631b08c474d70d8403c1c2fdd6ddcf2e879d5f3f7c
     container_name: ediplug-autoheal
     restart: always
     environment:
@@ -78,7 +81,9 @@ services:
       AUTOHEAL_INTERVAL: 15
       AUTOHEAL_START_PERIOD: 120
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Read-only mount of the socket file; Docker API calls (incl. restarts) still work through it, so this is only
+      # a small hardening. Not used in the active-passive setup (see docs/runtime-setup.md).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     logging: *logging
 
 networks:

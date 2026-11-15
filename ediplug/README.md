@@ -40,7 +40,6 @@ Code changes on top of upstream:
 | `config/openas2.properties` | EDIPLUG values for `config.xml` properties: DB URL from `$ENV{AS2_DB_*}`, polling intervals, folder layouts, Message-ID formats, MDN URL, outbox file filter, health check |
 | `config/logback.xml` | logging: console (`docker logs`), daily file in `/opt/openas2/logs`, ERROR e-mail via `SMTP_*` |
 | `config/rds-global-bundle.pem` | AWS RDS CA bundle (`AS2_DB_SSLMODE=verify-full`) |
-| `config/db-ca.pem` | CA of the former local PostgreSQL container (only for a self-hosted DB with that CA) |
 | `db/create_env_databases.sql` | creates one environment's databases (`ediplug-<env>`, `openas2-<env>`), roles, tables, triggers and grants; idempotent |
 | `deploy/docker-compose.yml` | server node: nginx (LB target :80) → OpenAS2, plus autoheal |
 | `deploy/docker-compose.local.yml` | developer machine (Windows/Linux): OpenAS2 only, ports on localhost |
@@ -87,8 +86,8 @@ docker buildx build -f ediplug/Dockerfile --platform linux/amd64,linux/arm64 -t 
 |---|---|
 | `AS2_DB_HOST` / `AS2_DB_PORT` / `AS2_DB_NAME` | `postgres` / `5432` / `openas2` |
 | `AS2_DB_USER` / `AS2_DB_PASSWORD` | `openas2` / … |
-| `AS2_DB_SSLMODE` | `verify-ca` (local container), `verify-full` (RDS) |
-| `AS2_DB_SSLROOTCERT` | `/opt/openas2/config/db-ca.pem` (local), `/opt/openas2/config/rds-global-bundle.pem` (RDS) |
+| `AS2_DB_SSLMODE` | `verify-full` (RDS), `disable` (local test database without TLS) |
+| `AS2_DB_SSLROOTCERT` | `/opt/openas2/config/rds-global-bundle.pem` (RDS); another CA: mount its PEM and point here |
 | `AS2_KEY_ENCRYPTION_PASSWORD` | passphrase of the encrypted private keys in `as2_own_key` (never stored in the DB) |
 | `AS2_KEYSTORE_PASSWORD` | protects entries of the in-memory keystore only |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` | error alert email |
@@ -127,7 +126,7 @@ Partnerships (XML → DB), using the tool shipped in the image:
 
 ```sh
 docker run --rm --network <net> -v $PWD:/mig:ro --entrypoint /opt/openas2/bin/upgrade/migrate_partnerships_to_db.sh \
-  openas2-ediplug:multiarch-v2 /mig/partnerships.xml "jdbc:postgresql://<host>:5432/openas2?sslmode=verify-ca&sslrootcert=/opt/openas2/config_template/db-ca.pem" \
+  openas2-ediplug:multiarch-v2 /mig/partnerships.xml "jdbc:postgresql://<host>:5432/openas2?sslmode=verify-full&sslrootcert=/opt/openas2/config_template/rds-global-bundle.pem" \
   <admin user> <password> --dry-run      # then again without --dry-run
 ```
 
