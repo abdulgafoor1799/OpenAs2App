@@ -48,7 +48,6 @@ entrypoint checks before the JVM starts that the directory is writable and stops
 
 | Tag | Runs on |
 |---|---|
-| `openas2-ediplug:multiarch-v2`, `:latest` | both: Docker picks the matching variant |
 | `openas2-ediplug:arm64-v2` | ARM64: OCI Ampere A1, AWS Graviton, Apple silicon, Windows on ARM |
 | `openas2-ediplug:x86-v2` | x86-64: Intel/AMD PCs (Windows 11 + Docker Desktop), OCI E4/E5 standard, AWS t3/m6i |
 
@@ -57,39 +56,93 @@ build.
 
 ---
 
-## 1. Local on Windows 11 (Docker Desktop)
+## 1. Local on Windows 11 (Docker Desktop + WSL 2)
 
-1. Install Docker Desktop with the **WSL 2** backend (default) and Ubuntu from the Microsoft Store.
-2. Get the image, either from ECR:
+In Explorer, the "Linux" entry shows two distributions. **Ubuntu** is yours: the project lives there. **docker-desktop**
+is Docker's internal VM: never put files there or work in it. The `docker` command only works inside Ubuntu after
+WSL integration is switched on (step 3).
+
+### One-time setup
+1. **WSL 2 + Ubuntu** (PowerShell):
    ```powershell
-   aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.ap-south-1.amazonaws.com
-   docker pull <account>.dkr.ecr.ap-south-1.amazonaws.com/openas2-ediplug:x86-v2
+   wsl --install -d Ubuntu      # skip if Ubuntu is already installed; create the Linux user when asked
+   wsl --update
+   wsl -l -v                    # Ubuntu must show VERSION 2; if 1: wsl --set-version Ubuntu 2
    ```
-   or from a saved file: `docker load -i openas2-ediplug-x86-v2.tar.gz`.
-3. Make the project folder **inside WSL** (Ubuntu shell). Bind mounts from `C:\` are slow and case-insensitive,
-   and AS2 IDs are case-sensitive (`outbox/ACME` and `outbox/acme` would be the same folder):
+2. **Docker Desktop** installed and running. Settings > General: "Use the WSL 2 based engine" is on.
+3. **Connect Docker to Ubuntu**: Docker Desktop > Settings > Resources > **WSL integration** > tick "Enable
+   integration with my default WSL distro" **and switch on Ubuntu** > Apply & restart.
+4. Close every Ubuntu window (or `wsl --shutdown` in PowerShell), open Ubuntu again and check:
    ```sh
-   mkdir -p ~/ediplug && cd ~/ediplug
-   # copy from the repo: ediplug/deploy/{docker-compose.local.yml,.env.example,override/}
-   cp .env.example .env            # OPENAS2_IMAGE=openas2-ediplug:x86-v2 (or the ECR name); DB + key passwords
-   mkdir -p data && sudo chown -R 1000:0 data && sudo chmod -R g+rwX data
+   docker version               # must show Client AND Server
+   docker compose version
+   docker run --rm hello-world
    ```
-   Edit with VS Code (`code .` from WSL). Save `.env` with LF line endings. In `.env`, `$` must be written `$$`.
-   Alternative: a named volume (set `AS2_DATA_DIR=as2data` and uncomment `volumes:` in
-   `docker-compose.local.yml`); reach the files with `docker cp` or `docker exec`.
-4. Optional property changes: `cp override/openas2.properties.example override/openas2.properties` and keep only
-   the lines you change, uncommented.
-5. Database: either RDS dev (`AS2_DB_SSLMODE=verify-full`, your public IP allowed in the RDS security group) or a
-   local PostgreSQL container created with `ediplug/db/create_env_databases.sql` (`AS2_DB_SSLMODE=disable`,
-   `AS2_DB_HOST=host.docker.internal`).
-6. Start and check:
+   - `docker: command not found` / "could not be found in this WSL 2 distro": step 3 not done for Ubuntu, or Docker
+     Desktop is not running.
+   - `permission denied ... docker.sock`: in Docker Desktop toggle the Ubuntu integration off/on, Apply, then
+     `wsl --shutdown` and reopen Ubuntu.
+5. Tools inside Ubuntu: `sudo apt-get update && sudo apt-get install -y git curl unzip nano`
+
+### Project folder (inside Ubuntu, under your Linux home)
+6. Get the deploy files, either from GitHub (private repo: run `gh auth login` first, or use a token) or from a copy on
+   Windows (`C:\Users\<win-user>\Downloads\deploy` is `/mnt/c/Users/<win-user>/Downloads/deploy` in Ubuntu):
    ```sh
-   docker compose -f docker-compose.local.yml up -d
-   docker logs -f EDIPLUG_AS2_LOCAL      # "[ediplug-entrypoint] Data directory ...", "OpenAS2 Server v4.15.0 started."
-   curl http://localhost:10099/          # health
+   git clone --depth 1 -b ediplug/db-config https://github.com/abdulgafoor1799/OpenAs2App.git ~/src/OpenAs2App
+   mkdir -p ~/ediplug
+   cp ~/src/OpenAs2App/ediplug/deploy/docker-compose.local.yml ~/src/OpenAs2App/ediplug/deploy/.env.example ~/ediplug/
+   cp -r ~/src/OpenAs2App/ediplug/deploy/override ~/ediplug/
+   cd ~/ediplug
+   mkdir -p data && sudo chown -R 1000:0 data && chmod -R g+rwX data
    ```
-7. Test: put a `.edi` file in `data/outbox/<sender AS2 ID>/<receiver AS2 ID>/`; MDNs land in `data/mdn/`, received
-   files in `data/inbox/`. From Windows Explorer the folder is `\\wsl$\Ubuntu\home\<you>\ediplug\data`.
+   Keep the folder here, not under `/mnt/c/...`: Windows drives are slow from containers and case-insensitive
+   (`outbox/ACME` and `outbox/acme` would be one folder).
+
+### Image (Intel/AMD PC = `x86-v2`; Windows on ARM = `arm64-v2`)
+7. Either pull it from ECR (AWS CLI inside Ubuntu, with a key that may pull from the repository):
+   ```sh
+   curl -fsSo /tmp/awscli.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+   unzip -q /tmp/awscli.zip -d /tmp && sudo /tmp/aws/install
+   aws configure                                    # key, secret, region ap-south-1
+   aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 071370395173.dkr.ecr.ap-south-1.amazonaws.com
+   docker pull 071370395173.dkr.ecr.ap-south-1.amazonaws.com/openas2-ediplug:x86-v2
+   ```
+   or load the saved file: `docker load -i /mnt/c/Users/<win-user>/Downloads/openas2-ediplug-x86-v2.tar.gz`
+   (gives `openas2-ediplug:x86-v2`).
+   Check: `docker image inspect --format '{{.Architecture}}' <image>` prints `amd64`.
+
+### Configuration
+8. `.env`:
+   ```sh
+   cp .env.example .env && chmod 600 .env && nano .env
+   ```
+   - `OPENAS2_IMAGE` = the image name from step 7 (ECR name or `openas2-ediplug:x86-v2`).
+   - `AS2_DB_HOST/PORT/NAME/USER/PASSWORD`: the environment's `openas2-<env>` database and `openas2_<env>` role.
+     RDS: allow your public IP (`curl -s ifconfig.me`) on 5432 in the RDS security group, keep
+     `AS2_DB_SSLMODE=verify-full`. A database on the PC itself: `AS2_DB_HOST=host.docker.internal`,
+     `AS2_DB_SSLMODE=disable`.
+   - `AS2_KEY_ENCRYPTION_PASSWORD`: the passphrase the keys in `as2_own_key` were encrypted with (the database needs
+     at least one enabled own key, or OpenAS2 does not start). `AS2_KEYSTORE_PASSWORD`: any long random value.
+   - A `$` inside a value must be written `$$`. Editing with VS Code: `code .` from Ubuntu (WSL extension) keeps LF
+     line endings.
+9. Optional property changes: `cp override/openas2.properties.example override/openas2.properties`, keep only the
+   lines you change, uncommented.
+
+### Run
+10. ```sh
+    docker compose -f docker-compose.local.yml up -d
+    docker logs -f EDIPLUG_AS2_LOCAL     # [ediplug-entrypoint] lines, "Loaded ...", "OpenAS2 Server v4.15.0 started."
+    curl -i http://localhost:10099/      # HTTP 200 = healthy
+    ```
+    The ports are also reachable from Windows (browser / Postman): `http://localhost:10080` (AS2 receive),
+    `:10081` (async MDN), `:10099` (health).
+11. Test: copy a `.edi` file to `data/outbox/<sender AS2 ID>/<receiver AS2 ID>/`; MDNs appear in `data/mdn/`, received
+    files in `data/inbox/`.
+12. Files from Windows: Explorer > Linux > **Ubuntu** > home > `<linux-user>` > ediplug > data (or run `explorer.exe .`
+    inside `~/ediplug`).
+
+Day to day: `docker compose -f docker-compose.local.yml restart openas2` after editing `override/`;
+`... down` to stop; new image: `docker pull ...` (or `docker load`), then `up -d`.
 
 ## 2. On a Linux VM
 
