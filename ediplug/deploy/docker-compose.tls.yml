@@ -1,0 +1,95 @@
+# EDIPLUG AS2 node on a single VM with TLS terminated on the VM (Let's Encrypt): nginx (80/443) -> OpenAS2, plus
+# autoheal. PostgreSQL is external (AWS RDS). Use this file as docker-compose.yml in the deploy folder (e.g.
+# /opt/ediplug). For a node behind a cloud load balancer use docker-compose.yml instead.
+#   cp .env.example .env    # fill in, chmod 600
+#   docker compose up -d
+# Needs the Compose v2 plugin (docker compose ...), not docker-compose 1.x.
+name: ediplug-as2
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ediplug-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      AS2_PUBLIC_HOSTNAME: ${AS2_PUBLIC_HOSTNAME:?set AS2_PUBLIC_HOSTNAME in .env}
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx          # render the template to /etc/nginx/nginx.conf
+    volumes:
+      - ./nginx/nginx-tls.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+      - ./nginx/certs:/etc/nginx/certs:ro             # fullchain.pem + privkey.pem from the certbot deploy hook
+    depends_on:
+      openas2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t -q || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    networks: [app]
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    labels:
+      autoheal: "true"
+
+  openas2:
+    image: ${OPENAS2_IMAGE:?set OPENAS2_IMAGE in .env}   # e.g. <account>.dkr.ecr.<region>.amazonaws.com/openas2-ediplug:arm64-v2
+    container_name: EDIPLUG_AS2_SERVER
+    restart: unless-stopped
+    init: true
+    environment:
+      AS2_DB_HOST: ${AS2_DB_HOST:?}
+      AS2_DB_PORT: ${AS2_DB_PORT:-5432}
+      AS2_DB_NAME: ${AS2_DB_NAME:?}
+      AS2_DB_USER: ${AS2_DB_USER:?}
+      AS2_DB_PASSWORD: ${AS2_DB_PASSWORD:?}
+      AS2_DB_SSLMODE: ${AS2_DB_SSLMODE:-verify-full}
+      AS2_DB_SSLROOTCERT: ${AS2_DB_SSLROOTCERT:-/opt/openas2/config/rds-global-bundle.pem}
+      AS2_KEY_ENCRYPTION_PASSWORD: ${AS2_KEY_ENCRYPTION_PASSWORD:?}
+      AS2_KEYSTORE_PASSWORD: ${AS2_KEYSTORE_PASSWORD:?}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      OPENAS2_LOG_LEVEL: ${OPENAS2_LOG_LEVEL:-INFO}
+      OPENAS2_PROPERTIES_OVERRIDE_MODE: ${OPENAS2_PROPERTIES_OVERRIDE_MODE:-merge}
+    volumes:
+      # inbox / outbox / MDNs / pending state; writable by UID 1000 (chown -R 1000:0 ./data)
+      - ./data:/opt/openas2/data:rw
+      # runtime properties, at least as2_async_mdn_url=https://<AS2_PUBLIC_HOSTNAME>/mdn (see override/*.example)
+      - ./override:/opt/openas2/override:ro
+    expose: ["10080", "10081", "10099"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:10099/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    stop_grace_period: 40s       # OpenAS2 waits up to 25s for in-flight sends on shutdown
+    networks: [app]
+    logging: *logging
+    labels:
+      autoheal: "true"
+
+  autoheal:
+    # Pinned by digest (multi-arch index of 1.2.0): this container controls Docker on the host. To update:
+    # docker buildx imagetools inspect willfarrell/autoheal:<new tag>, review the release, replace tag and digest.
+    image: willfarrell/autoheal:1.2.0@sha256:31f580ef0279eaced5b38d631b08c474d70d8403c1c2fdd6ddcf2e879d5f3f7c
+    container_name: ediplug-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal      # only containers labelled autoheal=true
+      AUTOHEAL_INTERVAL: 15
+      AUTOHEAL_START_PERIOD: 120
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging: *logging
+
+networks:
+  app:
+    driver: bridge

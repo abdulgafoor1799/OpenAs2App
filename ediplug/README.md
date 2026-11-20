@@ -41,7 +41,9 @@ Code changes on top of upstream:
 | `config/logback.xml` | logging: console (`docker logs`), daily file in `/opt/openas2/logs`, ERROR e-mail via `SMTP_*` |
 | `config/rds-global-bundle.pem` | AWS RDS CA bundle (`AS2_DB_SSLMODE=verify-full`) |
 | `db/create_env_databases.sql` | creates one environment's databases (`ediplug-<env>`, `openas2-<env>`), roles, tables, triggers and grants; idempotent |
-| `deploy/docker-compose.yml` | server node: nginx (LB target :80) → OpenAS2, plus autoheal |
+| `deploy/docker-compose.yml` | server node behind a cloud load balancer: nginx (LB target :80) → OpenAS2, plus autoheal |
+| `deploy/docker-compose.tls.yml` | single VM with TLS on the VM (Let's Encrypt): nginx 80/443 with rate limits → OpenAS2, plus autoheal |
+| `deploy/nginx/nginx-tls.conf.template` | nginx for that setup: `server_name ${AS2_PUBLIC_HOSTNAME}`, catch-all 444 / TLS reject, per-endpoint rate limits, 50 MB AS2 bodies |
 | `deploy/docker-compose.local.yml` | developer machine (Windows/Linux): OpenAS2 only, ports on localhost |
 | `deploy/nginx/nginx.conf` | routes `/receive` (AS2 receive), `/mdn` (async MDN), `/health` to OpenAS2, everything else 403; real client IP from the LB |
 | `deploy/.env.example` | every environment variable with placeholders (copy to `.env`, never commit it) |
@@ -69,16 +71,17 @@ From the repository root. Needs Docker with buildx; on an ARM64 host, x86 builds
 # one architecture (the host's)
 docker build -f ediplug/Dockerfile -t openas2-ediplug:arm64-v2 .                                    # with tests
 docker build -f ediplug/Dockerfile --build-arg SKIP_TESTS=true -t openas2-ediplug:arm64-v2 .        # quick
-# another architecture / both (a multi-arch tag needs the containerd image store or --push)
-docker buildx build -f ediplug/Dockerfile --platform linux/amd64 -t openas2-ediplug:x86-v2 --load .
-docker buildx build -f ediplug/Dockerfile --platform linux/amd64,linux/arm64 -t openas2-ediplug:multiarch-v2 --load .
+# the other architecture (--provenance/--sbom off: no extra untagged attestation entries in ECR)
+docker buildx build -f ediplug/Dockerfile --platform linux/amd64 --provenance=false --sbom=false -t openas2-ediplug:x86-v2 --load .
 ```
 
 | Tag | Architecture | Same as |
 |---|---|---|
-| `multiarch-v2`, `latest` | linux/arm64 + linux/amd64 | `openas2:4.15.0-ediplug-s7` |
-| `arm64-v2` | linux/arm64 (Ampere, Graviton, Apple silicon) | |
+| `arm64-v2` | linux/arm64 (Ampere, Graviton, Apple silicon) | `openas2:4.15.0-ediplug-s7` |
 | `x86-v2` | linux/amd64 (Windows 11 / Docker Desktop on Intel/AMD, x86 VMs) | |
+
+ECR (`openas2-ediplug`) holds exactly these two tags; there is no multi-arch tag and no `latest`, so every host
+names its tag explicitly.
 
 ## Environment
 
@@ -126,7 +129,7 @@ Partnerships (XML → DB), using the tool shipped in the image:
 
 ```sh
 docker run --rm --network <net> -v $PWD:/mig:ro --entrypoint /opt/openas2/bin/upgrade/migrate_partnerships_to_db.sh \
-  openas2-ediplug:multiarch-v2 /mig/partnerships.xml "jdbc:postgresql://<host>:5432/openas2?sslmode=verify-full&sslrootcert=/opt/openas2/config_template/rds-global-bundle.pem" \
+  openas2-ediplug:arm64-v2 /mig/partnerships.xml "jdbc:postgresql://<host>:5432/openas2?sslmode=verify-full&sslrootcert=/opt/openas2/config_template/rds-global-bundle.pem" \
   <admin user> <password> --dry-run      # then again without --dry-run
 ```
 
@@ -134,7 +137,7 @@ Own key pairs from an existing PKCS12 keystore (one-off; plaintext keys stay in 
 
 ```sh
 docker run --rm --tmpfs /tmp -e P12_PASSWORD -e AS2_KEY_ENCRYPTION_PASSWORD -v $PWD/ediplug/tools:/tools:ro \
-  -v /path/to/as2_certs.p12:/in.p12:ro --entrypoint sh openas2-ediplug:multiarch-v2 \
+  -v /path/to/as2_certs.p12:/in.p12:ro --entrypoint sh openas2-ediplug:arm64-v2 \
   /tools/p12-to-own-key-sql.sh /in.p12 ediplug_as2 ediplug_sana_as2 | psql -v ON_ERROR_STOP=1 -d openas2
 ```
 

@@ -1,0 +1,114 @@
+# EDIPLUG AS2 node with TLS terminated on the VM (Let's Encrypt), used by docker-compose.tls.yml.
+# Template: the nginx image renders it at start with envsubst (only variables that are set are replaced, so nginx's
+# own $host, $binary_remote_addr ... stay). Variables: AS2_PUBLIC_HOSTNAME (e.g. as2-dev.ediplug.com).
+# Certificates: /etc/nginx/certs/{fullchain,privkey}.pem, copied there by the certbot deploy hook.
+
+worker_processes auto;
+
+events {
+  worker_connections 4096;
+}
+
+http {
+  # ---- Rate limiting / abuse protection ----
+  # Global, every request on ports 80 and 443, per client IP: 20 req/s, bursts up to 40 extra, max 30 connections.
+  limit_req_zone  $binary_remote_addr zone=req_per_ip:20m rate=20r/s;
+  limit_conn_zone $binary_remote_addr zone=conn_per_ip:10m;
+  # Per endpoint (applied in addition to the global limit):
+  #   AS2 messages and async MDNs: 5 req/s per IP, bursts of 20 served immediately, max 10 connections per IP
+  #   health check: 1 req/s per IP, burst 5 (load balancers / monitors poll every few seconds)
+  limit_req_zone  $binary_remote_addr zone=as2_ip:20m    rate=5r/s;
+  limit_req_zone  $binary_remote_addr zone=health_ip:10m rate=1r/s;
+
+  limit_req         zone=req_per_ip burst=40 nodelay;
+  limit_req_status  429;
+  limit_req_log_level warn;
+  limit_conn        conn_per_ip 30;
+  limit_conn_status 429;
+  limit_conn_log_level warn;
+
+  # Drop slow / stalled clients (slowloris-style) quickly.
+  client_header_timeout 15s;
+  client_body_timeout   30s;
+  send_timeout          30s;
+  keepalive_timeout     30s;
+  # Default request body limit everywhere else; the AS2 locations allow large EDI payloads.
+  client_max_body_size  1m;
+  server_tokens off;
+
+  upstream as2_receive_upstream { server openas2:10080; }
+  upstream as2_mdn_upstream     { server openas2:10081; }
+  upstream as2_health_upstream  { server openas2:10099; }
+
+  # ---- Catch-all: drop anything not addressed to our name (bare-IP scans, wrong Host headers) ----
+  # Port 80: close the connection without a response (444).
+  server {
+    listen 80 default_server;
+    server_name _;
+    return 444;
+  }
+
+  # Port 443: reject the TLS handshake when the requested name (SNI) is not ours, so no certificate is presented.
+  server {
+    listen 443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+  }
+
+  server {
+    listen 80;
+    server_name ${AS2_PUBLIC_HOSTNAME};
+    return 301 https://$host$request_uri;
+  }
+
+  server {
+    listen 443 ssl;
+    http2 on;
+    server_name ${AS2_PUBLIC_HOSTNAME};
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+
+    location = /receive {
+      # Optionally restrict to trading partner IPs:
+      # allow 203.0.113.0/24;
+      # allow 198.51.100.0/24;
+      # deny all;
+      limit_req  zone=req_per_ip burst=40 nodelay;   # repeated: a location-level limit_req replaces the inherited one
+      limit_req  zone=as2_ip burst=20 nodelay;
+      limit_conn conn_per_ip 10;
+      client_max_body_size 50m;
+      client_body_timeout 120s;
+      proxy_request_buffering off;   # stream large messages to OpenAS2 instead of buffering them in nginx
+      proxy_read_timeout 300s;       # synchronous MDN: OpenAS2 answers after decrypt/verify/store
+      proxy_send_timeout 300s;
+      proxy_pass http://as2_receive_upstream;
+    }
+
+    location = /mdn {
+      # allow 203.0.113.0/24;
+      # deny all;
+      limit_req  zone=req_per_ip burst=40 nodelay;   # repeated: a location-level limit_req replaces the inherited one
+      limit_req  zone=as2_ip burst=20 nodelay;
+      limit_conn conn_per_ip 10;
+      client_max_body_size 50m;
+      proxy_read_timeout 300s;
+      proxy_pass http://as2_mdn_upstream;
+    }
+
+    location = /health {
+      limit_req zone=req_per_ip burst=40 nodelay;
+      limit_req zone=health_ip burst=5 nodelay;
+      proxy_pass http://as2_health_upstream;
+    }
+
+    location / {
+      return 403;
+    }
+  }
+}

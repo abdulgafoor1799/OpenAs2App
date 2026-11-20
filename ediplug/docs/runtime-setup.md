@@ -156,7 +156,7 @@ docker compose up -d
 docker logs EDIPLUG_AS2_SERVER 2>&1 | grep -E "ediplug-entrypoint|Loaded|ERROR|started"
 ```
 
-- Image tag must match the CPU (`uname -m`: `aarch64` = arm64, `x86_64` = x86), or use `multiarch-v2`.
+- Image tag must match the CPU (`uname -m`: `aarch64` = arm64, `x86_64` = x86).
 - SELinux enforcing (Oracle Linux, RHEL): add `:z` to the bind mounts (`./data:/opt/openas2/data:rw,z`,
   `./override:/opt/openas2/override:ro,z`).
 - Host log files (optional): `mkdir logs && sudo chown 1000:0 logs` and mount `./logs:/opt/openas2/logs`.

@@ -12,7 +12,8 @@
 # Outbox file filter for every partnership poller (empty = every file)
 #pollerConfigBase.fileextensionfilter=edi,EDI,xml,XML
 
-# Public URL partners send asynchronous MDNs to
+# Public URL partners send asynchronous MDNs to. The image default is https://as2.ediplug.com/mdn (prod), so every
+# other environment MUST set its own: https://<AS2_PUBLIC_HOSTNAME>/mdn
 #as2_async_mdn_url=https://as2-dev.ediplug.com/mdn
 
 # How often the DB version counters are checked (seconds)

@@ -8,7 +8,7 @@
 #   docker build -f ediplug/Dockerfile --build-arg SKIP_TESTS=true -t openas2:4.15.0-ediplug .   # faster, no tests
 # Other / several CPU architectures (the Java build runs once, natively; only the small runtime stage is per platform):
 #   docker buildx build -f ediplug/Dockerfile --platform linux/amd64 -t openas2-ediplug:x86-v2 --load .
-#   docker buildx build -f ediplug/Dockerfile --platform linux/amd64,linux/arm64 -t openas2-ediplug:multiarch-v2 --load .
+#   (images are pushed per architecture: arm64-v2, x86-v2; add --provenance=false --sbom=false for ECR)
 #
 # Runtime openas2.properties: see ediplug/bin/ediplug-entrypoint.sh (mount /opt/openas2/override/openas2.properties).
 

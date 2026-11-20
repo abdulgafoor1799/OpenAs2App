@@ -1,6 +1,6 @@
 # Local / developer run of OpenAS2 only (no nginx, no autoheal), e.g. Docker Desktop on Windows 11 or a Linux laptop.
 # Ports are published on localhost: 10080 receive AS2, 10081 receive async MDN, 10099 health.
-#   cp .env.example .env    # fill in; OPENAS2_IMAGE=openas2-ediplug:x86-v2 (Intel/AMD PC) or :arm64-v2 / :multiarch-v2
+#   cp .env.example .env    # fill in; OPENAS2_IMAGE=openas2-ediplug:x86-v2 (Intel/AMD PC) or :arm64-v2 (ARM)
 #   docker compose -f docker-compose.local.yml up -d
 name: ediplug-as2-local
 

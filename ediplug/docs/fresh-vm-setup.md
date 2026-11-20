@@ -24,9 +24,11 @@ Files: `ediplug/deploy/` in the `ediplug/db-config` branch of the OpenAs2App for
 
 ## 0. Decisions before you start
 
-1. **CPU architecture.** `openas2-ediplug:multiarch-v2` runs on ARM64 (AWS Graviton t4g / m7g / c7g, OCI Ampere)
-   and x86-64 hosts; `arm64-v2` / `x86-v2` are the single-architecture builds.
-2. **Load balancer type.**
+1. **CPU architecture.** `openas2-ediplug:arm64-v2` for ARM64 (AWS Graviton t4g / m7g / c7g, OCI Ampere),
+   `openas2-ediplug:x86-v2` for x86-64 hosts.
+2. **TLS on a load balancer or on the VM.** This runbook uses a load balancer (`docker-compose.yml`). For a single VM
+   that terminates TLS itself with Let's Encrypt, see "Single VM with TLS on the VM" at the end.
+3. **Load balancer type.**
    - **NLB** (recommended for AS2): static Elastic IPs per AZ, which many retailers require for firewall
      allowlisting. Use a **TLS listener on 443 with the ACM certificate**, forwarding TCP to target port 80. To see
      real client IPs, enable *proxy protocol v2* on the target group and switch nginx to
@@ -34,7 +36,7 @@ Files: `ediplug/deploy/` in the `ediplug/db-config` branch of the OpenAs2App for
    - **ALB**: simpler HTTP features and no static IPs. HTTPS listener with ACM forwarding HTTP to port 80; nginx
      reads `X-Forwarded-For`. Set the ALB idle timeout ≥ 300 s for large messages.
    - Either way: health check `HTTP GET /health` on port 80, healthy 200, interval 30 s.
-3. **One active node at a time.** Outbox, pending-MDN and resend state live in the node's local `./data`. An
+4. **One active node at a time.** Outbox, pending-MDN and resend state live in the node's local `./data`. An
    asynchronous MDN that lands on another node cannot be matched to its message. Run a single active target
    (keep a stopped standby, or a second target only for failover). Active-passive with `./data` on shared storage
    (OCI File Storage / AWS EFS) is described in `runtime-setup.md`; never run two OpenAS2 on the same data.
@@ -43,7 +45,7 @@ Files: `ediplug/deploy/` in the `ediplug/db-config` branch of the OpenAs2App for
 
 | Resource | Settings |
 |---|---|
-| ECR repository | `openas2-ediplug`, scan on push (mutable tags if you use `latest`) |
+| ECR repository | `openas2-ediplug`, scan on push; tags `arm64-v2`, `x86-v2` |
 | RDS PostgreSQL 16+ (tested on 18.3) | Multi-AZ, encrypted, not publicly accessible, parameter `rds.force_ssl=1` |
 | Security group `as2-lb` | inbound 443 from partners (or 0.0.0.0/0) |
 | Security group `as2-node` | inbound 80 **only from `as2-lb`**; SSH only from your admin IP / SSM |
@@ -98,12 +100,10 @@ On a build host with the repository, Docker buildx and (on an ARM64 host, for th
 ```sh
 REG=<account>.dkr.ecr.<region>.amazonaws.com
 aws ecr get-login-password --region <region> | docker login --username AWS --password-stdin $REG
-# multi-arch (both architectures under one tag), straight to ECR; runs the test suite
-docker buildx build -f ediplug/Dockerfile --platform linux/amd64,linux/arm64 \
-  -t $REG/openas2-ediplug:multiarch-v2 -t $REG/openas2-ediplug:latest --push .
-# single-architecture tags, if wanted
-docker buildx build -f ediplug/Dockerfile --platform linux/arm64 -t $REG/openas2-ediplug:arm64-v2 --push .
-docker buildx build -f ediplug/Dockerfile --platform linux/amd64 -t $REG/openas2-ediplug:x86-v2 --push .
+# one image per architecture, straight to ECR; runs the test suite. --provenance/--sbom off: no untagged
+# attestation entries in the repository
+docker buildx build -f ediplug/Dockerfile --platform linux/arm64 --provenance=false --sbom=false -t $REG/openas2-ediplug:arm64-v2 --push .
+docker buildx build -f ediplug/Dockerfile --platform linux/amd64 --provenance=false --sbom=false -t $REG/openas2-ediplug:x86-v2 --push .
 ```
 
 ## 4. The VM
@@ -188,3 +188,50 @@ Startup failures to expect, and fixes:
 | Disk | inbox and MDN files grow without limit: archive/expire them |
 
 Never bake secrets into the image or commit `.env`. Rotate any credential that has been pasted into a chat or ticket.
+
+## Single VM with TLS on the VM (Let's Encrypt), e.g. as2-dev.ediplug.com
+
+No load balancer: nginx on the VM listens on 80/443 with a Let's Encrypt certificate (DNS-01 via Cloudflare), rate
+limits per client IP, and proxies `/receive`, `/mdn`, `/health` to OpenAS2. Files: `ediplug/deploy/docker-compose.tls.yml`,
+`ediplug/deploy/nginx/nginx-tls.conf.template`.
+
+1. DNS (Cloudflare): `A <hostname> -> <VM public IP>`, **DNS only**. VM firewall / security list: 80 and 443 open.
+2. Database: section 2 above (`create_env_databases.sql` with the environment name); allow the VM's IP on 5432 in the
+   RDS security group; load own keys, partners and partnerships.
+3. Deploy folder:
+   ```sh
+   sudo apt-get install -y docker-compose-v2 certbot python3-certbot-dns-cloudflare
+   sudo mkdir -p /opt/ediplug && sudo chown $USER: /opt/ediplug && cd /opt/ediplug
+   cp <repo>/ediplug/deploy/docker-compose.tls.yml docker-compose.yml
+   cp -r <repo>/ediplug/deploy/nginx <repo>/ediplug/deploy/override . && cp <repo>/ediplug/deploy/.env.example .env
+   chmod 600 .env && nano .env     # OPENAS2_IMAGE, AS2_PUBLIC_HOSTNAME, AS2_DB_*, key passwords, SMTP
+   printf 'as2_async_mdn_url=https://%s/mdn\n' <hostname> > override/openas2.properties   # image default is prod's URL
+   mkdir -p data nginx/certs && sudo chown -R 1000:0 data
+   ```
+4. Certificate + renewal hook (the Cloudflare API token needs Zone:DNS:Edit; file mode 600):
+   ```sh
+   sudo certbot certonly --dns-cloudflare --dns-cloudflare-credentials /home/ubuntu/.secrets/certbot/cloudflare.ini -d <hostname>
+   sudo tee /etc/letsencrypt/renewal-hooks/deploy/ediplug-<hostname>-cert-sync.sh >/dev/null <<'HOOK'
+   #!/bin/sh
+   # Copies the renewed certificate to the nginx folder and reloads nginx; ignores other certificates.
+   set -e
+   NAME=<hostname>; DST=/opt/ediplug/nginx/certs
+   [ "${RENEWED_LINEAGE:-/etc/letsencrypt/live/$NAME}" = "/etc/letsencrypt/live/$NAME" ] || exit 0
+   install -m 644 /etc/letsencrypt/live/$NAME/fullchain.pem $DST/fullchain.pem
+   install -m 600 /etc/letsencrypt/live/$NAME/privkey.pem   $DST/privkey.pem
+   docker exec ediplug-nginx nginx -s reload 2>/dev/null || true
+   HOOK
+   sudo chmod 755 /etc/letsencrypt/renewal-hooks/deploy/ediplug-<hostname>-cert-sync.sh
+   sudo /etc/letsencrypt/renewal-hooks/deploy/ediplug-<hostname>-cert-sync.sh     # seed the certs once
+   ```
+   The nginx container reads `privkey.pem` as root, so mode 600 owned by root is fine.
+5. Start: ECR login (section 4), `docker compose pull && docker compose up -d`.
+6. Verify: section 5, plus
+   - `curl -I http://<hostname>/health` gives 301; `curl https://<hostname>/health` gives 200; other paths 403;
+     `curl -k https://<VM IP>/` fails the TLS handshake (catch-all).
+   - `sudo certbot renew --dry-run` succeeds.
+
+Rate limits (per client IP, in `nginx-tls.conf.template`): everything 20 req/s (burst 40) and 30 connections;
+`/receive` and `/mdn` additionally 5 req/s (burst 20) and 10 connections; `/health` 1 req/s (burst 5). Over the limit
+nginx answers 429 and logs `limiting requests`. AS2 bodies up to 50 MB (`client_max_body_size`), 300 s for the
+synchronous MDN. Partner IP allowlists: uncomment the `allow` / `deny all` lines in `/receive` and `/mdn`.

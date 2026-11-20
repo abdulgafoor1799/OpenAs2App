@@ -30,7 +30,7 @@ services:
       autoheal: "true"
 
   openas2:
-    image: ${OPENAS2_IMAGE:?set OPENAS2_IMAGE in .env}   # e.g. <account>.dkr.ecr.<region>.amazonaws.com/openas2-ediplug:multiarch-v2
+    image: ${OPENAS2_IMAGE:?set OPENAS2_IMAGE in .env}   # e.g. <account>.dkr.ecr.<region>.amazonaws.com/openas2-ediplug:arm64-v2
     container_name: EDIPLUG_AS2_SERVER
     restart: always
     init: true
