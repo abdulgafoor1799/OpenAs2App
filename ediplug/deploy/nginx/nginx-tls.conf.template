@@ -4,6 +4,8 @@
 # Certificates: /etc/nginx/certs/{fullchain,privkey}.pem, copied there by the certbot deploy hook.
 
 worker_processes auto;
+# warn: rate-limit rejections ("limiting requests" / "limiting connections") are logged at warn
+error_log /var/log/nginx/error.log warn;
 
 events {
   worker_connections 4096;
@@ -35,6 +37,7 @@ http {
   # Default request body limit everywhere else; the AS2 locations allow large EDI payloads.
   client_max_body_size  1m;
   server_tokens off;
+  access_log /var/log/nginx/access.log;   # stdout in the nginx image (docker logs)
 
   upstream as2_receive_upstream { server openas2:10080; }
   upstream as2_mdn_upstream     { server openas2:10081; }
