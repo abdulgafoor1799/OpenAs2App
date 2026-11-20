@@ -1,0 +1,8 @@
+# Add-on for the HA setup (OCI NLB in front of a private VM): publishes the nginx health port for the NLB health
+# check. Use together with docker-compose.yml (= docker-compose.tls.yml):
+#   docker compose -f docker-compose.yml -f docker-compose.ha.yml up -d
+# (scripts/ha-node.sh sets COMPOSE_FILE so plain "docker compose" uses both).
+services:
+  nginx:
+    ports:
+      - "8081:8081"   # NLB health check: HTTP GET /health on port 8081; allow it from the VCN only (NSG)

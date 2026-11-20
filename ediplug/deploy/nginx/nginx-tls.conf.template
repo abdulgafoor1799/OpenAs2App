@@ -43,6 +43,22 @@ http {
   upstream as2_mdn_upstream     { server openas2:10081; }
   upstream as2_health_upstream  { server openas2:10099; }
 
+  # ---- Load balancer health check (HA setup: OCI NLB -> VM:8081). Not published in the standalone setup. ----
+  # Healthy only when OpenAS2 answers; private address ranges only (the NLB health checker sits in the VCN).
+  server {
+    listen 8081;
+    access_log off;
+    location = /health {
+      allow 10.0.0.0/8;
+      allow 172.16.0.0/12;
+      allow 192.168.0.0/16;
+      allow 127.0.0.1;
+      deny all;
+      proxy_pass http://as2_health_upstream;
+    }
+    location / { return 404; }
+  }
+
   # ---- Catch-all: drop anything not addressed to our name (bare-IP scans, wrong Host headers) ----
   # Port 80: close the connection without a response (444).
   server {

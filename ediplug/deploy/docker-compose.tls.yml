@@ -4,6 +4,8 @@
 #   cp .env.example .env    # fill in, chmod 600
 #   docker compose up -d
 # Needs the Compose v2 plugin (docker compose ...), not docker-compose 1.x.
+# Paths (defaults = this folder): AS2_DATA_DIR, AS2_CERTS_DIR, AS2_OVERRIDE_DIR. The HA setup points them at the FSS
+# mount and adds docker-compose.ha.yml (NLB health port); see docs/ha-openas2-oci-setup.md.
 name: ediplug-as2
 
 services:
@@ -19,7 +21,7 @@ services:
       NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx          # render the template to /etc/nginx/nginx.conf
     volumes:
       - ./nginx/nginx-tls.conf.template:/etc/nginx/templates/nginx.conf.template:ro
-      - ./nginx/certs:/etc/nginx/certs:ro             # fullchain.pem + privkey.pem from the certbot deploy hook
+      - ${AS2_CERTS_DIR:-./nginx/certs}:/etc/nginx/certs:ro   # fullchain.pem + privkey.pem from the certbot deploy hook
     depends_on:
       openas2:
         condition: service_healthy
@@ -60,9 +62,9 @@ services:
       OPENAS2_PROPERTIES_OVERRIDE_MODE: ${OPENAS2_PROPERTIES_OVERRIDE_MODE:-merge}
     volumes:
       # inbox / outbox / MDNs / pending state; writable by UID 1000 (chown -R 1000:0 ./data)
-      - ./data:/opt/openas2/data:rw
+      - ${AS2_DATA_DIR:-./data}:/opt/openas2/data:rw
       # runtime properties, at least as2_async_mdn_url=https://<AS2_PUBLIC_HOSTNAME>/mdn (see override/*.example)
-      - ./override:/opt/openas2/override:ro
+      - ${AS2_OVERRIDE_DIR:-./override}:/opt/openas2/override:ro
     expose: ["10080", "10081", "10099"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:10099/"]

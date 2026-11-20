@@ -44,11 +44,20 @@ Code changes on top of upstream:
 | `deploy/docker-compose.yml` | server node behind a cloud load balancer: nginx (LB target :80) → OpenAS2, plus autoheal |
 | `deploy/docker-compose.tls.yml` | single VM with TLS on the VM (Let's Encrypt): nginx 80/443 with rate limits → OpenAS2, plus autoheal |
 | `deploy/nginx/nginx-tls.conf.template` | nginx for that setup: `server_name ${AS2_PUBLIC_HOSTNAME}`, catch-all 444 / TLS reject, per-endpoint rate limits, 50 MB AS2 bodies |
+| `deploy/docker-compose.ha.yml` | add-on for the HA setup: publishes nginx's NLB health port 8081 |
+| `deploy/scripts/vm-bootstrap.sh` | host preparation: Docker + Compose v2, AWS CLI, certbot + Cloudflare plugin (`--with-nfs` for HA) |
+| `deploy/scripts/setup-node.sh` | builds `/opt/ediplug` from git (standalone or `--shared` FSS layout); creates `.env`/override once |
+| `deploy/scripts/issue-cert.sh` | Let's Encrypt via Cloudflare DNS-01 + renewal hook (copies certs, reloads nginx) |
+| `deploy/scripts/deploy-openas2.sh` | list ECR tags, deploy a tag (CPU check, wait healthy), `--rollback`, `--current` |
+| `deploy/scripts/ha-node.sh` | HA: owner file + heartbeat on FSS, start/stop/takeover, split-brain guard, cert renewal on the owner |
+| `deploy/iam/ecr-pull-only-policy.json` | IAM policy for the VMs' ECR key: login + pull/list `openas2-ediplug` only |
 | `deploy/docker-compose.local.yml` | developer machine (Windows/Linux): OpenAS2 only, ports on localhost |
 | `deploy/nginx/nginx.conf` | routes `/receive` (AS2 receive), `/mdn` (async MDN), `/health` to OpenAS2, everything else 403; real client IP from the LB |
 | `deploy/.env.example` | every environment variable with placeholders (copy to `.env`, never commit it) |
 | `deploy/override/openas2.properties.example` | template for runtime property overrides |
 | `tools/p12-to-own-key-sql.sh` | one-off: converts key pairs from a `.p12` into encrypted `as2_own_key` upserts |
+| `docs/standalone-openas2-vm-setup.md` | playbook: a public VM node (`as2-test`, `as2-test2`, ...) from a running VM to verified |
+| `docs/ha-openas2-oci-setup.md` | playbook: private VMs behind OCI NLB + NAT, shared state and TLS on FSS, failover |
 | `docs/runtime-setup.md` | data directory + runtime properties on Windows, Linux VMs and an active-passive pair with shared storage (OCI FSS) |
 | `docs/fresh-vm-setup.md` | full first deployment of a node behind a load balancer (RDS, ECR, verification, operations) |
 | `docs/keystore-and-reloads.md` | how keys, certificates, trusted CAs and partnerships load and hot-swap |
