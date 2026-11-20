@@ -209,12 +209,7 @@ public class DirectoryResenderModule extends BaseResenderModule {
                 } catch (OpenAS2Exception e) {
                     // Just log and ignore since it will have been handled upstream
                     logger.error("Error resending message", e);
-                    // EDIPLUG: the file is moved to the error folder once, and processing stops here. Falling
-                    // through used to try to delete the moved file ("successfully sent but not deleted") and
-                    // then archive it a second time ("does not exist"): three extra ERRORs for one failure.
-                    IOUtil.handleArchive(file, getParameter(PARAM_ERROR_DIRECTORY, true), false);
-                    logger.warn("Resend file moved to the error folder: " + file.getName() + msg.getLogMsgID());
-                    return;
+                    IOUtil.handleArchive(file, getParameter(PARAM_ERROR_DIRECTORY, true));
                 }
 
                 if (!file.delete()) { // Delete the file, sender will re-queue if the transmission fails again
