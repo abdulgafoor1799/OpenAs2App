@@ -964,6 +964,22 @@ public class AS2Util {
             msg.setAttribute(FileAttribute.MA_ERROR_DIR, (String) pifois.readObject());
             msg.setAttribute(FileAttribute.MA_SENT_DIR, (String) pifois.readObject());
             msg.getAttributes().putAll((Map<String, String>) pifois.readObject());
+            // EDIPLUG: 9th entry (written since v2.2): the Message-ID. Optional, files written by older versions
+            // end after the attributes. The MDN receiver has already set the ID from the MDN, so it is kept;
+            // the stale-MDN sweep starts without one and takes it from here.
+            try {
+                String storedMsgId = (String) pifois.readObject();
+                if (storedMsgId != null && !storedMsgId.isEmpty()) {
+                    if (msg.getMessageID() == null || msg.getMessageID().isEmpty()) {
+                        msg.setMessageID(storedMsgId);
+                    } else if (!storedMsgId.equals(msg.getMessageID()) && logger.isDebugEnabled()) {
+                        logger.debug("Message-ID in pending info file " + inFile.getName() + " is " + storedMsgId
+                                + ", the MDN refers to " + msg.getMessageID() + msg.getLogMsgID());
+                    }
+                }
+            } catch (EOFException e) {
+                // written by an older version: no Message-ID entry
+            }
 
             if (logger.isTraceEnabled()) {
                 logger.trace("Data retrieved from Pending info file:" + "\n        Original MIC: " + msg.getCalculatedMIC() + "\n        Retry Count: " + retries + "\n        Original file name : " + msg.getPayloadFilename() + "\n        Sent file name : " + msg.getAttribute(FileAttribute.MA_FILENAME) + "\n        Pending message file : " + msg.getAttribute(FileAttribute.MA_PENDINGFILE) + "\n        Error directory: " + msg.getAttribute(FileAttribute.MA_ERROR_DIR) + "\n        Sent directory: " + msg.getAttribute(FileAttribute.MA_SENT_DIR) + "\n        Attributes: " + msg.getAttributes() + msg.getLogMsgID());

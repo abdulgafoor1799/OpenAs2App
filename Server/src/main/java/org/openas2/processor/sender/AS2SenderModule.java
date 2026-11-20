@@ -580,6 +580,10 @@ public class AS2SenderModule extends HttpSenderModule implements HasSchedule {
             String sentDir = msg.getAttribute(FileAttribute.MA_SENT_DIR);
             oos.writeObject((sentDir == null ? "" : sentDir));
             oos.writeObject(msg.getAttributes());
+            // EDIPLUG: 9th entry, the Message-ID the file is named after. The name alone cannot be turned back
+            // into the ID (cleanFilename removes characters), and the stale-MDN sweep only has the file. Written
+            // last so readers of the first eight entries are unaffected; a resend rewrites it with the new ID.
+            oos.writeObject(msg.getMessageID());
             if (logger.isTraceEnabled()) {
                 logger.trace("Pending info file written to:" + pendingInfoFile + "\n\tOriginal MIC: " + msg.getCalculatedMIC() + "\n\tRetry Count: " + retries + "\n\tOriginal file name : " + msg.getAttribute(FileAttribute.MA_FILENAME) + "\n\tPending message file : " + pendingFile + "\n\tError directory: " + msg.getAttribute(FileAttribute.MA_ERROR_DIR) + "\n\tSent directory: " + msg.getAttribute(FileAttribute.MA_SENT_DIR) + "\n\tAttributes: " + msg.getAttributes() + msg.getLogMsgID());
             }
@@ -670,7 +674,13 @@ public class AS2SenderModule extends HttpSenderModule implements HasSchedule {
                 AS2Util.cleanupFiles(msg, true);
                 // Logger significant msg state
                 msg.setOption("STATE", Message.MSG_STATE_MDN_ASYNC_RECEIVE_FAIL);
-                msg.trackMsgState(getSession());                
+                // EDIPLUG: the Message-ID comes from the pending info file (9th entry). Files written by older
+                // versions do not have it: without an ID the tracking update can only fail (msg_id NOT NULL).
+                if (msg.getMessageID() != null && !msg.getMessageID().isEmpty()) {
+                    msg.trackMsgState(getSession());
+                } else {
+                    logger.warn("Stale pending info file has no Message-ID (written by an older version); message tracking not updated: " + inFile.getAbsolutePath());
+                }
             }
         }
     }
