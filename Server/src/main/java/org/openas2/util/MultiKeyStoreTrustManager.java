@@ -38,15 +38,27 @@ public class MultiKeyStoreTrustManager implements X509TrustManager {
      * Builds a trust manager over the given key stores.
      *
      * @param keyStores - the stores to trust, consulted in this order; a null entry stands for the JVM's
-     *                    own trust store, as it does when initialising a TrustManagerFactory
+     *                    own trust store, as it does when initialising a TrustManagerFactory. An empty store
+     *                    is skipped: it trusts nothing, and the PKIX trust manager built from it fails every
+     *                    check with a RuntimeException ("trustAnchors parameter must be non-empty") instead of
+     *                    a CertificateException, which would stop the later stores from being consulted.
      * @return a trust manager that trusts what any of the stores trusts
      * @throws GeneralSecurityException if a store cannot be used to initialise a trust manager
      */
     public static MultiKeyStoreTrustManager forKeyStores(KeyStore... keyStores) throws GeneralSecurityException {
         List<X509TrustManager> managers = new ArrayList<X509TrustManager>();
         for (KeyStore keyStore : keyStores) {
+            if (keyStore != null && keyStore.size() == 0) {
+                continue;
+            }
             TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
             tmf.init(keyStore);
+            managers.add(x509TrustManager(tmf));
+        }
+        if (managers.isEmpty()) {
+            // only empty stores were given: trust what the JVM trusts
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            tmf.init((KeyStore) null);
             managers.add(x509TrustManager(tmf));
         }
         return new MultiKeyStoreTrustManager(managers);

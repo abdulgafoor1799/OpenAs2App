@@ -91,6 +91,26 @@ public class MultiKeyStoreTrustManagerTest {
     }
 
     @Test
+    public void anEmptyStoreIsSkippedSoTheNextStoreDecides() throws Exception {
+        KeyStore empty = KeyStore.getInstance("PKCS12");
+        empty.load(null, null);
+        MultiKeyStoreTrustManager tm = MultiKeyStoreTrustManager.forKeyStores(empty, trustStore(secondRoot));
+
+        tm.checkServerTrusted(new X509Certificate[]{secondRoot}, "RSA");
+        // a rejection must be a CertificateException, not the RuntimeException an empty PKIX store throws
+        assertThrows(CertificateException.class, () -> tm.checkServerTrusted(new X509Certificate[]{unknownRoot}, "RSA"));
+    }
+
+    @Test
+    public void onlyEmptyStoresMeansTheJvmTrustStore() throws Exception {
+        KeyStore empty = KeyStore.getInstance("PKCS12");
+        empty.load(null, null);
+        int jvmIssuers = MultiKeyStoreTrustManager.forKeyStores((KeyStore) null).getAcceptedIssuers().length;
+
+        assertEquals(jvmIssuers, MultiKeyStoreTrustManager.forKeyStores(empty).getAcceptedIssuers().length);
+    }
+
+    @Test
     public void atLeastOneTrustManagerIsRequired() {
         assertThrows(IllegalArgumentException.class, () -> new MultiKeyStoreTrustManager(Collections.emptyList()));
     }

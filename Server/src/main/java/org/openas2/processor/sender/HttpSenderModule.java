@@ -1,5 +1,7 @@
 package org.openas2.processor.sender;
 
+import java.security.KeyStore;
+import java.security.KeyStoreException;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -34,10 +36,16 @@ public abstract class HttpSenderModule extends BaseSenderModule {
         options.put(HTTPUtil.PARAM_SOCKET_TIMEOUT, getParameter(PARAM_SOCKET_TIMEOUT, getParameter(PARAM_READ_TIMEOUT, DEFAULT_TIMEOUT_MILLIS)));
         try {
             X509CertificateFactory cf = (X509CertificateFactory) getSession().getCertificateFactory(CertificateFactory.COMPID_SSL_TRUST_CERTIFICATE_FACTORY);
-            if (cf != null) {
-                options.put(PARAM_CUSTOM_SSL_TRUST_STORE, cf.getKeyStore());
+            // EDIPLUG: only a trust store that holds certificates. An empty one (e.g. the database-backed
+            // ssl_trust_certs with no rows) would make every HTTPS send fail with "trustAnchors parameter must
+            // be non-empty" instead of using the JVM's trusted CAs.
+            KeyStore trustStore = cf == null ? null : cf.getKeyStore();
+            if (trustStore != null && trustStore.size() > 0) {
+                options.put(PARAM_CUSTOM_SSL_TRUST_STORE, trustStore);
             }
         } catch (ComponentNotFoundException e) {
+        } catch (KeyStoreException e) {
+            throw new OpenAS2Exception("Cannot read the SSL trust keystore", e);
         }
         return options;
     }
