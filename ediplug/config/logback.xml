@@ -42,7 +42,8 @@
         <password>${SMTP_PASS}</password>
         <to>support@ediplug.com</to>
         <from>as2-errors@ediplug.com</from>
-        <subject>EDIPLUG AS2 FAILURE ALERT</subject>
+        <!-- AS2_NODE_NAME (compose: defaults to AS2_PUBLIC_HOSTNAME) tells the servers apart; then the first error -->
+        <subject>[${AS2_NODE_NAME:-unnamed-node}] EDIPLUG AS2 ALERT: %logger{0} - %.-120m</subject>
         <layout class="ch.qos.logback.classic.PatternLayout">
             <pattern>
         AS2 Failure Alert

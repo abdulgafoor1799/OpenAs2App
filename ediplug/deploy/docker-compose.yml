@@ -49,6 +49,7 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       OPENAS2_LOG_LEVEL: ${OPENAS2_LOG_LEVEL:-INFO}
+      AS2_NODE_NAME: ${AS2_NODE_NAME:-${AS2_PUBLIC_HOSTNAME:-as2-node}}   # shown in alert e-mail subjects
       OPENAS2_PROPERTIES_OVERRIDE_MODE: ${OPENAS2_PROPERTIES_OVERRIDE_MODE:-merge}   # merge | replace
     volumes:
       # inbox / outbox / MDNs / pending state; must be writable by UID 1000 (chown -R 1000:0 ./data)

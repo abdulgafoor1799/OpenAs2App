@@ -663,6 +663,11 @@ public class AS2SenderModule extends HttpSenderModule implements HasSchedule {
                 // Logger the message
                 logger.warn("Exception occurred processing stale pending info file: " + inFile.getAbsolutePath() + " Error was: " + e.getMessage(), e);
             } finally {
+                // EDIPLUG: the pending info file is named after the message ID (without <>); without it the
+                // tracking update below had no msg_id and failed on the NOT NULL column.
+                if (msg.getMessageID() == null || msg.getMessageID().isEmpty()) {
+                    msg.setMessageID("<" + files[i] + ">");
+                }
                 String msgStr = "Pending information file detected that is past max wait time, Failure most likely due to not receiving MDN response in Async mode: " + inFile.getAbsolutePath();
                 msg.setLogMsg(msgStr);
                 msg.setStatus(Message.MSG_STATUS_MSG_TERMINATED_IN_ERROR);
