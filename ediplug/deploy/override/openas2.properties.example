@@ -25,3 +25,9 @@
 
 # Resend attempts after a failed send
 #processor.resend_max_retries=5
+
+# Message-ID of outgoing messages. $rand.shortUUID$ = 22 base62 characters (full 128-bit random UUID),
+# $rand.UUID$ = 36-character UUID. Since v2.2 the image default already uses shortUUID:
+#as2_message_id_format=msg.$date.yyyy-MM-dd-HHmmss$.$rand.shortUUID$.$msg.sender.as2_id$.to.$msg.receiver.as2_id$
+# Message-ID of the MDNs we send (image default still uses the long UUID):
+#as2_mdn_message_id_format=mdn.$date.yyyy-MM-dd-HHmmss$.$rand.shortUUID$.$msg.receiver.as2_id$.to.$msg.sender.as2_id$
