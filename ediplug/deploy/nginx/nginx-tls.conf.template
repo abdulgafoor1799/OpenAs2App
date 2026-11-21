@@ -94,6 +94,10 @@ http {
     proxy_set_header X-Forwarded-Proto https;
 
     location = /receive {
+      # Only real AS2 traffic reaches OpenAS2: a GET or an empty POST (browsers, scanners, curl checks) would be
+      # logged by OpenAS2 as "no data" (ERROR on /mdn -> alert e-mail). AS2 messages and MDNs are POSTs with a body.
+      if ($request_method != POST) { return 405; }
+      if ($http_content_length = "0") { return 400; }
       # Optionally restrict to trading partner IPs:
       # allow 203.0.113.0/24;
       # allow 198.51.100.0/24;
@@ -110,6 +114,10 @@ http {
     }
 
     location = /mdn {
+      # Only real AS2 traffic reaches OpenAS2: a GET or an empty POST (browsers, scanners, curl checks) would be
+      # logged by OpenAS2 as "no data" (ERROR on /mdn -> alert e-mail). AS2 messages and MDNs are POSTs with a body.
+      if ($request_method != POST) { return 405; }
+      if ($http_content_length = "0") { return 400; }
       # allow 203.0.113.0/24;
       # deny all;
       limit_req  zone=req_per_ip burst=40 nodelay;   # repeated: a location-level limit_req replaces the inherited one
